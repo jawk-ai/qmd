@@ -12,6 +12,7 @@ import type {
   EmbeddingResult,
   GenerateOptions,
   GenerateResult,
+  LlamaToken,
   ModelInfo,
   Queryable,
   QueryType,
@@ -363,6 +364,25 @@ export class RemoteLLM implements LLM {
       this.expandBreaker.onFailure();
       throw err;
     }
+  }
+
+  // Tokenization is not supported by remote backends — chunking must use a
+  // local backend. RemoteLLM is intended to be paired with LlamaCpp via
+  // HybridLLM, which routes tokenize/detokenize to the local backend.
+  tokenize(_text: string): Promise<readonly LlamaToken[]> {
+    return Promise.reject(
+      new Error(
+        "RemoteLLM.tokenize() is not supported — wrap with HybridLLM(remote, local) so chunking can use the local tokenizer.",
+      ),
+    );
+  }
+
+  detokenize(_tokens: readonly LlamaToken[]): Promise<string> {
+    return Promise.reject(
+      new Error(
+        "RemoteLLM.detokenize() is not supported — wrap with HybridLLM(remote, local) so chunking can use the local tokenizer.",
+      ),
+    );
   }
 
   async dispose(): Promise<void> {

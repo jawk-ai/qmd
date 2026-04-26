@@ -487,9 +487,12 @@ async function showStatus(): Promise<void> {
   }
 
   // Device / GPU info
+  // Device probing is meaningful only for the local LlamaCpp backend; remote
+  // backends don't expose a getDeviceInfo() API. Cast through LlamaCpp here
+  // since this CLI surface is intentionally local-only.
   console.log(`\n${c.bold}Device${c.reset}`);
   try {
-    const llm = getDefaultLlamaCpp();
+    const llm = getDefaultLLM() as LlamaCpp;
     const device = await llm.getDeviceInfo({ allowBuild: false });
     if (device.gpu) {
       console.log(`  GPU:      ${c.green}${device.gpu}${c.reset} (offloading: ${device.gpuOffloading ? 'yes' : 'no'})`);

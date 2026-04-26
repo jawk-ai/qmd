@@ -14,6 +14,7 @@ import {
   type LlamaEmbeddingContext,
   type Token as LlamaToken,
 } from "node-llama-cpp";
+export type { LlamaToken };
 import { homedir } from "os";
 import { join } from "path";
 import { existsSync, mkdirSync, statSync, unlinkSync, readdirSync, readFileSync, writeFileSync, openSync, readSync, closeSync } from "fs";
@@ -416,6 +417,18 @@ export interface LLM {
    * Returns list of documents with relevance scores (higher = more relevant)
    */
   rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult>;
+
+  /**
+   * Tokenize text using the embedding model's tokenizer.
+   * Required by chunking pipeline (store.ts).
+   * Remote backends without local tokenizer access should throw with a clear message.
+   */
+  tokenize(text: string): Promise<readonly LlamaToken[]>;
+
+  /**
+   * Detokenize token IDs back to text.
+   */
+  detokenize(tokens: readonly LlamaToken[]): Promise<string>;
 
   /**
    * Dispose of resources

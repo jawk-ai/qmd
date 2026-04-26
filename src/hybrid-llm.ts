@@ -13,6 +13,7 @@ import type {
   EmbeddingResult,
   GenerateOptions,
   GenerateResult,
+  LlamaToken,
   ModelInfo,
   Queryable,
   RerankDocument,
@@ -62,6 +63,16 @@ export class HybridLLM implements LLM {
 
   modelExists(model: string): Promise<ModelInfo> {
     return this.local.modelExists(model);
+  }
+
+  // Tokenization always routes to local — chunking is CPU-cheap and remote
+  // backends typically don't expose a compatible tokenizer endpoint.
+  tokenize(text: string): Promise<readonly LlamaToken[]> {
+    return this.local.tokenize(text);
+  }
+
+  detokenize(tokens: readonly LlamaToken[]): Promise<string> {
+    return this.local.detokenize(tokens);
   }
 
   async dispose(): Promise<void> {
