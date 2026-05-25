@@ -1698,7 +1698,7 @@ function parseChunkStrategy(value: unknown): ChunkStrategy | undefined {
 async function vectorIndex(
   model: string = DEFAULT_EMBED_MODEL_URI,
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; sessionMaxMs?: number },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
@@ -1735,6 +1735,7 @@ async function vectorIndex(
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     chunkStrategy: batchOptions?.chunkStrategy,
+    sessionMaxMs: batchOptions?.sessionMaxMs,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       const percent = (info.bytesProcessed / info.totalBytes) * 100;
@@ -2526,6 +2527,7 @@ function parseCLI() {
       force: { type: "boolean", short: "f" },
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
+      "session-max-ms": { type: "string" },  // Override 30min embed session timeout
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -2747,6 +2749,8 @@ function showHelp(): void {
   console.log("  qmd embed [-f]                - Generate/refresh vector embeddings");
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
+  console.log("    --session-max-ms <ms>       - Override embed session timeout (default 30 min, 0 = no timeout).");
+  console.log("                                  Env: QMD_EMBED_SESSION_MAX_MS. CLI flag takes precedence.");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -3132,10 +3136,20 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
+        const sessionMaxRaw = cli.values["session-max-ms"];
+        let sessionMaxMs: number | undefined;
+        if (typeof sessionMaxRaw === "string") {
+          const parsed = parseInt(sessionMaxRaw, 10);
+          if (!Number.isFinite(parsed) || parsed < 0) {
+            throw new Error(`--session-max-ms must be a non-negative integer (got "${sessionMaxRaw}"); use 0 to disable timeout`);
+          }
+          sessionMaxMs = parsed;
+        }
         await vectorIndex(DEFAULT_EMBED_MODEL_URI, !!cli.values.force, {
           maxDocsPerBatch,
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
+          sessionMaxMs,
         });
       } catch (error) {
         console.error(error instanceof Error ? error.message : String(error));

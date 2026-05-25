@@ -1304,6 +1304,12 @@ export type EmbedOptions = {
   maxBatchBytes?: number;
   chunkStrategy?: ChunkStrategy;
   onProgress?: (info: EmbedProgress) => void;
+  /**
+   * Max embed-session duration in milliseconds. Overrides default of 30 min.
+   * Precedence: this option > QMD_EMBED_SESSION_MAX_MS env > 30*60*1000.
+   * Set 0 to disable timeout entirely.
+   */
+  sessionMaxMs?: number;
 };
 
 type PendingEmbeddingDoc = {
@@ -1432,6 +1438,12 @@ export async function generateEmbeddings(
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const llm = getLlm(store);
   const embedModelUri = llm.embedModelName;
+
+  // Resolve session max duration: option > env > default(30 min). 0 = disabled.
+  const envSessionMax = process.env.QMD_EMBED_SESSION_MAX_MS;
+  const envParsed = envSessionMax !== undefined ? parseInt(envSessionMax, 10) : NaN;
+  const sessionMaxMs = options?.sessionMaxMs
+    ?? (Number.isFinite(envParsed) && envParsed >= 0 ? envParsed : 30 * 60 * 1000);
 
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
@@ -1578,7 +1590,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors };
-  }, { maxDuration: 30 * 60 * 1000, name: 'generateEmbeddings' });
+  }, { maxDuration: sessionMaxMs, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
