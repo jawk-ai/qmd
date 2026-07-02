@@ -33,6 +33,11 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import {
+  mapWithConcurrency,
+  resolveEmbedConcurrency,
+  resolveEmbedBatchSize,
+} from "./concurrency.js";
 
 // =============================================================================
 // Configuration
@@ -1452,7 +1457,11 @@ export async function generateEmbeddings(
     let bytesProcessed = 0;
     let totalChunks = 0;
     let vectorTableInitialized = false;
-    const BATCH_SIZE = 32;
+    // Chunks per embedBatch call. Follows QMD_REMOTE_BATCH_SIZE (default 32) so
+    // that one store-level batch maps to exactly one HTTP request on remote backends.
+    const BATCH_SIZE = resolveEmbedBatchSize();
+    // How many embedBatch calls may be in flight at once (QMD_EMBED_CONCURRENCY, default 1).
+    const embedConcurrency = resolveEmbedConcurrency();
     const batches = buildEmbeddingBatches(docsToEmbed, maxDocsPerBatch, maxBatchBytes);
 
     for (const batchMeta of batches) {
@@ -1513,26 +1522,16 @@ export async function generateEmbeddings(
       const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
       let batchChunkBytesProcessed = 0;
 
+      // Split into embed batches and dispatch through a bounded worker pool.
+      // With embedConcurrency=1 (default) this is exactly the old sequential loop.
+      const chunkBatches: ChunkItem[][] = [];
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
-        // Abort early if session has been invalidated (e.g. max duration exceeded)
-        if (!session.isValid) {
-          const remaining = batchChunks.length - batchStart;
-          errors += remaining;
-          console.warn(`⚠ Session expired — skipping ${remaining} remaining chunks`);
-          break;
-        }
+        chunkBatches.push(batchChunks.slice(batchStart, Math.min(batchStart + BATCH_SIZE, batchChunks.length)));
+      }
 
-        // Abort early if error rate is too high (>80% of processed chunks failed)
-        const processed = chunksEmbedded + errors;
-        if (processed >= BATCH_SIZE && errors > processed * 0.8) {
-          const remaining = batchChunks.length - batchStart;
-          errors += remaining;
-          console.warn(`⚠ Error rate too high (${errors}/${processed}) — aborting embedding`);
-          break;
-        }
+      let abortReason: "session-expired" | "error-rate" | null = null;
 
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
-        const chunkBatch = batchChunks.slice(batchStart, batchEnd);
+      const embedOneBatch = async (chunkBatch: ChunkItem[]): Promise<true> => {
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
         try {
@@ -1583,6 +1582,42 @@ export async function generateEmbeddings(
           totalBytes,
           errors,
         });
+        return true;
+      };
+
+      const dispatched = await mapWithConcurrency(
+        chunkBatches,
+        embedConcurrency,
+        embedOneBatch,
+        // Checked before each batch dispatch — stops dispatching new batches
+        // when the session dies or the error rate explodes.
+        () => {
+          // Abort early if session has been invalidated (e.g. max duration exceeded)
+          if (!session.isValid) {
+            abortReason = "session-expired";
+            return false;
+          }
+          // Abort early if error rate is too high (>80% of processed chunks failed)
+          const processed = chunksEmbedded + errors;
+          if (processed >= BATCH_SIZE && errors > processed * 0.8) {
+            abortReason = "error-rate";
+            return false;
+          }
+          return true;
+        },
+      );
+
+      if (abortReason) {
+        let remaining = 0;
+        for (let i = 0; i < chunkBatches.length; i++) {
+          if (dispatched[i] === undefined) remaining += chunkBatches[i]!.length;
+        }
+        errors += remaining;
+        if (abortReason === "session-expired") {
+          console.warn(`⚠ Session expired — skipping ${remaining} remaining chunks`);
+        } else {
+          console.warn(`⚠ Error rate too high (${errors}/${chunksEmbedded + errors}) — aborting embedding`);
+        }
       }
 
       bytesProcessed += batchBytes;

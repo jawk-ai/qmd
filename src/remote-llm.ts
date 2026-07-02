@@ -54,6 +54,10 @@ export type RemoteLLMConfig = {
   rerankReadTimeoutMs?: number;
   /** Max texts per embed HTTP request (default: 32) */
   maxBatchSize?: number;
+  /** Max retries for 429/5xx embed responses before giving up (default: 3, 0 disables retry) */
+  embedMaxRetries?: number;
+  /** Base delay in ms for exponential backoff between embed retries (default: 500) */
+  embedRetryBaseDelayMs?: number;
 };
 
 // =============================================================================
@@ -111,7 +115,7 @@ class CircuitBreaker {
 
 export class RemoteLLM implements LLM {
   private readonly config: Required<
-    Pick<RemoteLLMConfig, "embedApiUrl" | "embedApiModel" | "connectTimeoutMs" | "embedReadTimeoutMs" | "rerankReadTimeoutMs" | "maxBatchSize">
+    Pick<RemoteLLMConfig, "embedApiUrl" | "embedApiModel" | "connectTimeoutMs" | "embedReadTimeoutMs" | "rerankReadTimeoutMs" | "maxBatchSize" | "embedMaxRetries" | "embedRetryBaseDelayMs">
   > & RemoteLLMConfig;
 
   private readonly embedBreaker = new CircuitBreaker();
@@ -125,6 +129,8 @@ export class RemoteLLM implements LLM {
       embedReadTimeoutMs: 30000,
       rerankReadTimeoutMs: 60000,
       maxBatchSize: 32,
+      embedMaxRetries: 3,
+      embedRetryBaseDelayMs: 500,
       ...config,
     };
   }
@@ -182,15 +188,37 @@ export class RemoteLLM implements LLM {
     });
 
     try {
-      const response = await fetchWithTimeout(url, {
-        method: "POST",
-        headers,
-        body,
-      }, this.config.embedReadTimeoutMs);
+      let attempt = 0;
+      let response: Response;
 
-      if (!response.ok) {
+      // Retry 429 (rate limit) and 5xx with exponential backoff + jitter.
+      // Retries happen before the circuit breaker sees a failure, so a
+      // transient 429 under high concurrency doesn't trip the breaker.
+      for (;;) {
+        response = await fetchWithTimeout(url, {
+          method: "POST",
+          headers,
+          body,
+        }, this.config.embedReadTimeoutMs);
+
+        if (response.ok) break;
+
+        const status = response.status;
+        const retryable = status === 429 || (status >= 500 && status < 600);
+        if (retryable && attempt < this.config.embedMaxRetries) {
+          const delayMs = computeRetryDelayMs(
+            response.headers.get("retry-after"),
+            attempt,
+            this.config.embedRetryBaseDelayMs,
+          );
+          await response.text().catch(() => ""); // drain body before retry
+          await sleep(delayMs);
+          attempt++;
+          continue;
+        }
+
         const errText = await response.text().catch(() => "");
-        throw new Error(`Embedding API returned ${response.status}: ${errText}`);
+        throw new Error(`Embedding API returned ${status}: ${errText}`);
       }
 
       const json = await response.json() as {
@@ -442,6 +470,37 @@ function normalizeUrl(baseUrl: string, path: string): string {
 }
 
 /**
+ * Compute the delay before the next retry attempt.
+ * Honors a Retry-After header (seconds or HTTP-date) when present; otherwise
+ * uses exponential backoff with up to 25% jitter. Capped at `capMs`.
+ * Exported for testing.
+ */
+export function computeRetryDelayMs(
+  retryAfterHeader: string | null,
+  attempt: number,
+  baseMs = 500,
+  capMs = 30_000,
+): number {
+  if (retryAfterHeader) {
+    const seconds = Number(retryAfterHeader);
+    if (Number.isFinite(seconds) && seconds >= 0) {
+      return Math.min(seconds * 1000, capMs);
+    }
+    const dateMs = Date.parse(retryAfterHeader);
+    if (!Number.isNaN(dateMs)) {
+      return Math.min(Math.max(0, dateMs - Date.now()), capMs);
+    }
+  }
+  const exp = baseMs * 2 ** attempt;
+  const jitter = Math.random() * exp * 0.25;
+  return Math.min(exp + jitter, capMs);
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise(resolve => setTimeout(resolve, ms));
+}
+
+/**
  * Fetch with a timeout using AbortSignal.timeout().
  */
 async function fetchWithTimeout(
@@ -494,6 +553,7 @@ export function remoteConfigFromEnv(yamlModels?: {
     rerankReadTimeoutMs: parseEnvInt("QMD_REMOTE_RERANK_TIMEOUT", 60000),
     expandReadTimeoutMs: parseEnvInt("QMD_REMOTE_EXPAND_TIMEOUT", 30000),
     maxBatchSize: parseEnvInt("QMD_REMOTE_BATCH_SIZE", 32),
+    embedMaxRetries: parseEnvNonNegativeInt("QMD_EMBED_MAX_RETRIES", 3),
   };
 }
 
@@ -502,4 +562,11 @@ function parseEnvInt(name: string, defaultValue: number): number {
   if (!val) return defaultValue;
   const parsed = parseInt(val, 10);
   return Number.isFinite(parsed) && parsed > 0 ? parsed : defaultValue;
+}
+
+function parseEnvNonNegativeInt(name: string, defaultValue: number): number {
+  const val = process.env[name];
+  if (!val) return defaultValue;
+  const parsed = parseInt(val, 10);
+  return Number.isFinite(parsed) && parsed >= 0 ? parsed : defaultValue;
 }

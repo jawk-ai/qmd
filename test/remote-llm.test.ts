@@ -6,7 +6,7 @@
 
 import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from "vitest";
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
-import { RemoteLLM, remoteConfigFromEnv, type RemoteLLMConfig } from "../src/remote-llm.js";
+import { RemoteLLM, remoteConfigFromEnv, computeRetryDelayMs, type RemoteLLMConfig } from "../src/remote-llm.js";
 import { HybridLLM } from "../src/hybrid-llm.js";
 import { isRemoteModel, formatQueryForEmbedding, formatDocForEmbedding, getDefaultLLM, setDefaultLLM, LlamaCpp } from "../src/llm.js";
 import type { LLM, EmbeddingResult, RerankResult, Queryable, GenerateResult, ModelInfo } from "../src/llm.js";
@@ -248,6 +248,127 @@ describe("RemoteLLM", () => {
       }
       // Next call should fail immediately with circuit breaker message
       await expect(llm.embed("test")).rejects.toThrow("circuit breaker");
+    });
+  });
+
+  describe("retry/backoff on 429 and 5xx", () => {
+    function retryLLM(overrides?: Partial<RemoteLLMConfig>): RemoteLLM {
+      // Tiny base delay so tests stay fast
+      return createRemoteLLM({ embedRetryBaseDelayMs: 1, ...overrides });
+    }
+
+    function okEmbedding() {
+      return {
+        status: 200,
+        body: { data: [{ embedding: [1.0, 2.0], index: 0 }] },
+      };
+    }
+
+    it("retries a 429 and succeeds", async () => {
+      let requests = 0;
+      setMockHandler(() => {
+        requests++;
+        if (requests === 1) return { status: 429, body: { error: "rate limited" } };
+        return okEmbedding();
+      });
+
+      const result = await retryLLM().embed("test");
+      expect(result).not.toBeNull();
+      expect(result!.embedding).toEqual([1.0, 2.0]);
+      expect(requests).toBe(2);
+    });
+
+    it("retries 5xx responses", async () => {
+      let requests = 0;
+      setMockHandler(() => {
+        requests++;
+        if (requests <= 2) return { status: 503, body: { error: "overloaded" } };
+        return okEmbedding();
+      });
+
+      const result = await retryLLM().embed("test");
+      expect(result).not.toBeNull();
+      expect(requests).toBe(3);
+    });
+
+    it("gives up after embedMaxRetries and throws", async () => {
+      let requests = 0;
+      setMockHandler(() => {
+        requests++;
+        return { status: 429, body: { error: "rate limited" } };
+      });
+
+      const llm = retryLLM({ embedMaxRetries: 2 });
+      await expect(llm.embed("test")).rejects.toThrow("429");
+      expect(requests).toBe(3); // 1 initial + 2 retries
+    });
+
+    it("does not retry non-retryable 4xx errors", async () => {
+      let requests = 0;
+      setMockHandler(() => {
+        requests++;
+        return { status: 400, body: { error: "bad request" } };
+      });
+
+      await expect(retryLLM().embed("test")).rejects.toThrow("400");
+      expect(requests).toBe(1);
+    });
+
+    it("embedMaxRetries=0 disables retries", async () => {
+      let requests = 0;
+      setMockHandler(() => {
+        requests++;
+        return { status: 429, body: { error: "rate limited" } };
+      });
+
+      await expect(retryLLM({ embedMaxRetries: 0 }).embed("test")).rejects.toThrow("429");
+      expect(requests).toBe(1);
+    });
+
+    it("a transient 429 does not trip the circuit breaker", async () => {
+      let requests = 0;
+      setMockHandler(() => {
+        requests++;
+        if (requests === 1) return { status: 429, body: { error: "rate limited" } };
+        return okEmbedding();
+      });
+
+      const llm = retryLLM();
+      await llm.embed("first"); // 429 then success — breaker stays closed
+      const result = await llm.embed("second");
+      expect(result).not.toBeNull();
+    });
+  });
+
+  describe("computeRetryDelayMs", () => {
+    it("uses Retry-After seconds when present", () => {
+      expect(computeRetryDelayMs("2", 0)).toBe(2000);
+      expect(computeRetryDelayMs("0", 5)).toBe(0);
+    });
+
+    it("caps Retry-After at the max", () => {
+      expect(computeRetryDelayMs("3600", 0)).toBe(30_000);
+    });
+
+    it("parses HTTP-date Retry-After", () => {
+      const future = new Date(Date.now() + 5000).toUTCString();
+      const delay = computeRetryDelayMs(future, 0);
+      expect(delay).toBeGreaterThan(2000);
+      expect(delay).toBeLessThanOrEqual(5000);
+    });
+
+    it("falls back to exponential backoff with jitter", () => {
+      const d0 = computeRetryDelayMs(null, 0, 500);
+      expect(d0).toBeGreaterThanOrEqual(500);
+      expect(d0).toBeLessThanOrEqual(500 * 1.25);
+
+      const d2 = computeRetryDelayMs(null, 2, 500);
+      expect(d2).toBeGreaterThanOrEqual(2000);
+      expect(d2).toBeLessThanOrEqual(2000 * 1.25);
+    });
+
+    it("never exceeds the cap", () => {
+      expect(computeRetryDelayMs(null, 20, 500)).toBeLessThanOrEqual(30_000);
     });
   });
 
@@ -641,6 +762,34 @@ describe("remoteConfigFromEnv", () => {
     });
     expect(config!.expandApiModel).toBe("yaml-expand-model");
     expect(config!.expandApiUrl).toBeUndefined();
+  });
+
+  it("parses QMD_EMBED_MAX_RETRIES (allowing 0)", () => {
+    process.env.QMD_EMBED_API_URL = "http://gpu:8000/v1";
+    process.env.QMD_EMBED_API_MODEL = "bge-m3";
+    try {
+      expect(remoteConfigFromEnv()!.embedMaxRetries).toBe(3);
+      process.env.QMD_EMBED_MAX_RETRIES = "5";
+      expect(remoteConfigFromEnv()!.embedMaxRetries).toBe(5);
+      process.env.QMD_EMBED_MAX_RETRIES = "0";
+      expect(remoteConfigFromEnv()!.embedMaxRetries).toBe(0);
+      process.env.QMD_EMBED_MAX_RETRIES = "-1";
+      expect(remoteConfigFromEnv()!.embedMaxRetries).toBe(3);
+    } finally {
+      delete process.env.QMD_EMBED_MAX_RETRIES;
+    }
+  });
+
+  it("parses QMD_REMOTE_BATCH_SIZE above 32 without capping", () => {
+    process.env.QMD_EMBED_API_URL = "http://gpu:8000/v1";
+    process.env.QMD_EMBED_API_MODEL = "bge-m3";
+    try {
+      expect(remoteConfigFromEnv()!.maxBatchSize).toBe(32);
+      process.env.QMD_REMOTE_BATCH_SIZE = "250";
+      expect(remoteConfigFromEnv()!.maxBatchSize).toBe(250);
+    } finally {
+      delete process.env.QMD_REMOTE_BATCH_SIZE;
+    }
   });
 
   it("expandApiModel not set when not in env or YAML", () => {
