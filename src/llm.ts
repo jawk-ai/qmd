@@ -43,15 +43,18 @@ export function isRemoteModel(modelUri: string): boolean {
 /**
  * Format a query for embedding.
  * Uses nomic-style task prefix format for embeddinggemma (default).
- * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active.
- * Remote models receive raw text (they handle their own formatting).
+ * Uses Qwen3-Embedding instruct format when a Qwen embedding model is active —
+ * including remote (OpenAI-compat) Qwen models: endpoints like Ollama/vLLM are
+ * passthrough and do NOT add the instruct prefix server-side, so skipping it
+ * costs 1-5% retrieval quality per Qwen's own evaluation.
+ * Other remote models receive raw text (unknown prompt conventions).
  */
 export function formatQueryForEmbedding(query: string, modelUri?: string): string {
   const uri = modelUri ?? process.env.QMD_EMBED_MODEL ?? DEFAULT_EMBED_MODEL;
-  if (isRemoteModel(uri)) return query;
   if (isQwen3EmbeddingModel(uri)) {
     return `Instruct: Retrieve relevant documents for the given query\nQuery: ${query}`;
   }
+  if (isRemoteModel(uri)) return query;
   return `task: search result | query: ${query}`;
 }
 

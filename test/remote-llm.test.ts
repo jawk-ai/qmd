@@ -677,6 +677,16 @@ describe("formatQueryForEmbedding with remote models", () => {
   it("should add prefix for local nomic models", () => {
     expect(formatQueryForEmbedding("test query", "hf:ggml-org/embeddinggemma-300M-GGUF/embeddinggemma-300M-Q8_0.gguf")).toContain("task:");
   });
+
+  it("should add Qwen3 instruct prefix for remote Qwen embedding models", () => {
+    const formatted = formatQueryForEmbedding("test query", "qwen3-embedding:8b-q8_0");
+    expect(formatted).toContain("Instruct:");
+    expect(formatted).toContain("Query: test query");
+  });
+
+  it("should keep documents raw for remote Qwen embedding models", () => {
+    expect(formatDocForEmbedding("doc text", "My Title", "qwen3-embedding:8b-q8_0")).toBe("My Title\ndoc text");
+  });
 });
 
 describe("formatDocForEmbedding with remote models", () => {
