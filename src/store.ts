@@ -3249,6 +3249,32 @@ async function getEmbedding(text: string, model: string, isQuery: boolean, sessi
  * Get all unique content hashes that need embeddings (from active documents).
  * Returns hash, document body, and a sample path for display purposes.
  */
+/**
+ * Rerank with graceful degradation. If the configured LLM has no reranker
+ * available (e.g. a remote embed provider like Gemini with no rerank endpoint,
+ * or no local reranker GGUF), fall back to reranker-scores derived from the
+ * candidate (RRF) order instead of throwing. Hybrid search then still returns
+ * RRF-ranked results rather than failing the whole query.
+ */
+async function rerankOrFallback(
+  store: Store,
+  query: string,
+  chunks: { file: string; text: string }[],
+  intent?: string,
+): Promise<{ file: string; score: number }[]> {
+  try {
+    return await store.rerank(query, chunks, undefined, intent);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/rerank/i.test(msg)) {
+      // Synthesize reranker scores from candidate order (already RRF-sorted),
+      // so downstream blending preserves the retrieval ranking.
+      return chunks.map((c, i) => ({ file: c.file, score: 1 / (i + 1) }));
+    }
+    throw err;
+  }
+}
+
 export function getHashesForEmbedding(db: Database): { hash: string; body: string; path: string }[] {
   return db.prepare(`
     SELECT d.hash, c.doc as body, MIN(d.path) as path
@@ -4264,7 +4290,7 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await rerankOrFallback(store, query, chunksToRerank, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -4656,7 +4682,7 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await rerankOrFallback(store, primaryQuery, chunksToRerank, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
