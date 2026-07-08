@@ -1,6 +1,6 @@
 # jawk-ai/qmd — maintained fork of tobi/qmd
 
-This repository is the **canonical search engine** for [qmd-hub](https://github.com/heintonny/qmd-hub)
+This repository is the **canonical search engine** for [qmd-hub](https://github.com/jawk-ai/qmd-hub)
 and the JAWK operator stack on srv1490285. It is **not** vanilla upstream `tobi/qmd`.
 
 The reference instance [qmd.jawk.ai](https://qmd.jawk.ai) builds this fork into the
