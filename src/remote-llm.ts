@@ -234,15 +234,19 @@ export class RemoteLLM implements LLM {
       // the response covers every input index exactly once.
       const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
       const seenIndices = new Set<number>();
+      const allHaveIndex = data.length > 0 && data.every(item => Number.isInteger(item?.index));
 
-      for (const item of data) {
-        const idx = item?.index;
-        if (!Number.isInteger(idx) || (idx as number) < 0 || (idx as number) >= texts.length) {
+      for (let i = 0; i < data.length; i++) {
+        const item = data[i]!;
+        // OpenAI-compatible APIs (including Gemini) often omit `index` and return
+        // vectors in request order. Use positional fallback in that case.
+        const idx = item.index;
+        const index = allHaveIndex ? (idx as number) : i;
+        if (!Number.isInteger(index) || index < 0 || index >= texts.length) {
           throw new Error(
-            `Embedding API returned an out-of-range index ${idx} for a batch of ${texts.length} input(s).`
+            `Embedding API returned an out-of-range index ${idx ?? i} for a batch of ${texts.length} input(s).`
           );
         }
-        const index = idx as number;
         if (seenIndices.has(index)) {
           throw new Error(`Embedding API returned a duplicate index ${index}.`);
         }

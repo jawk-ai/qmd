@@ -304,6 +304,23 @@ describe("RemoteLLM", () => {
       expect(results[1]!.embedding).toEqual([0.2]);
       expect(results[2]!.embedding).toEqual([0.3]);
     });
+
+    it("uses positional mapping when index is omitted (Gemini/OpenAI default)", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          data: [
+            { embedding: [0.1, 0.2] },
+            { embedding: [0.3, 0.4] },
+          ],
+        },
+      }));
+
+      const llm = createRemoteLLM();
+      const results = await llm.embedBatch(["a", "b"]);
+      expect(results[0]!.embedding).toEqual([0.1, 0.2]);
+      expect(results[1]!.embedding).toEqual([0.3, 0.4]);
+    });
   });
 
   describe("error handling", () => {
