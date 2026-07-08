@@ -1218,6 +1218,46 @@ Uses node-llama-cpp's `createRankingContext()` and `rankAndSort()` API for cross
 
 Used for generating query variations via `LlamaChatSession`.
 
+### Remote Embedding & Reranking
+
+QMD can offload embedding and reranking to a remote OpenAI-compatible server (vLLM, Ollama, LM Studio, OpenAI, etc.) while keeping query expansion local.
+
+**Environment variables** (presence of `QMD_EMBED_API_URL` activates remote mode):
+
+| Variable | Required | Description |
+|----------|----------|-------------|
+| `QMD_EMBED_API_URL` | Yes | Base URL, e.g. `http://gpu-host:8000/v1` |
+| `QMD_EMBED_API_MODEL` | Yes | Model name, e.g. `BAAI/bge-m3` |
+| `QMD_EMBED_API_KEY` | No | Bearer token for auth |
+| `QMD_RERANK_API_URL` | No | Rerank endpoint (defaults to embed URL) |
+| `QMD_RERANK_API_MODEL` | No | Rerank model name |
+| `QMD_RERANK_API_KEY` | No | Rerank auth (defaults to embed key) |
+| `QMD_EMBED_CONCURRENCY` | No | Concurrent embedding requests during `qmd embed` (default `1` = sequential). Raise (e.g. `4`–`8`) to saturate high-rate-limit APIs like Gemini. |
+| `QMD_REMOTE_BATCH_SIZE` | No | Texts per embedding HTTP request (default `32`). Also controls the chunk batch size in `qmd embed`, so larger values (e.g. `100`–`250`) mean fewer, bigger requests. |
+| `QMD_EMBED_MAX_RETRIES` | No | Retries for HTTP 429/5xx embed responses with exponential backoff + jitter, honoring `Retry-After` (default `3`, `0` disables) |
+
+**Throughput tuning:** with a remote backend, `qmd embed` sends one HTTP request per `QMD_REMOTE_BATCH_SIZE` chunks and keeps up to `QMD_EMBED_CONCURRENCY` requests in flight. For example `QMD_EMBED_CONCURRENCY=6 QMD_REMOTE_BATCH_SIZE=100` gives up to 600 chunks in flight. Defaults (`1`/`32`) preserve the fully sequential behavior.
+
+**YAML config** (`~/.config/qmd/index.yml`):
+```yaml
+models:
+  embed_api_url: "http://gpu-host:8000/v1"
+  embed_api_model: "BAAI/bge-m3"
+  rerank_api_model: "BAAI/bge-reranker-v2-m3"
+```
+
+**Example with vLLM:**
+```sh
+# Start vLLM with an embedding model
+vllm serve BAAI/bge-m3 --task embed
+
+# Point QMD at it
+export QMD_EMBED_API_URL=http://localhost:8000/v1
+export QMD_EMBED_API_MODEL=BAAI/bge-m3
+qmd embed
+qmd query "your search query"
+```
+
 ## License
 
 MIT

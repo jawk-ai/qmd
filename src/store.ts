@@ -20,14 +20,14 @@ import { readFileSync, realpathSync, statSync, mkdirSync } from "node:fs";
 import fastGlob from "fast-glob";
 import { qmdHomedir } from "./paths.js";
 import {
-  LlamaCpp,
-  getDefaultLlamaCpp,
+  getDefaultLLM,
   formatQueryForEmbedding,
   formatDocForEmbedding,
   withLLMSessionForLlm,
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  type LLM,
   type RerankDocument,
   type ILLMSession,
 } from "./llm.js";
@@ -37,6 +37,11 @@ import type {
   CollectionConfig,
   ContextMap,
 } from "./collections.js";
+import {
+  mapWithConcurrency,
+  resolveEmbedConcurrency,
+  resolveEmbedBatchSize,
+} from "./concurrency.js";
 
 // =============================================================================
 // Configuration
@@ -78,11 +83,11 @@ export function getEmbeddingFingerprint(model: string = DEFAULT_EMBED_MODEL): st
 }
 
 /**
- * Get the LlamaCpp instance for a store — prefers the store's own instance,
+ * Get the LLM instance for a store — prefers the store's own instance,
  * falls back to the global singleton.
  */
-function getLlm(store: Store): LlamaCpp {
-  return store.llm ?? getDefaultLlamaCpp();
+function getLlm(store: Store): LLM {
+  return store.llm ?? getDefaultLLM();
 }
 
 // =============================================================================
@@ -1270,8 +1275,8 @@ function ensureVecTableInternal(db: Database, dimensions: number): void {
 export type Store = {
   db: Database;
   dbPath: string;
-  /** Optional LlamaCpp instance for this store (overrides the global singleton) */
-  llm?: LlamaCpp;
+  /** Optional LLM instance for this store (overrides the global singleton) */
+  llm?: LLM;
   close: () => void;
   ensureVecTable: (dimensions: number) => void;
 
@@ -1514,6 +1519,12 @@ export type EmbedOptions = {
    */
   maxDurationMs?: number;
   onProgress?: (info: EmbedProgress) => void;
+  /**
+   * Max embed-session duration in milliseconds. Overrides default of 30 min.
+   * Precedence: this option > QMD_EMBED_SESSION_MAX_MS env > 30*60*1000.
+   * Set 0 to disable timeout entirely.
+   */
+  sessionMaxMs?: number;
 };
 
 type PendingEmbeddingDoc = {
@@ -1706,13 +1717,26 @@ export async function generateEmbeddings(
   // Use store's LlamaCpp or global singleton, wrapped in a session
   const embedModelUri = model;
 
+  // Resolve session max duration: sessionMaxMs option > maxDurationMs option
+  // (legacy v2.6.3 alias) > QMD_EMBED_SESSION_MAX_MS env > default(30 min).
+  // 0 = disabled.
+  const envSessionMax = process.env.QMD_EMBED_SESSION_MAX_MS;
+  const envParsed = envSessionMax !== undefined ? parseInt(envSessionMax, 10) : NaN;
+  const sessionMaxMs = options?.sessionMaxMs
+    ?? options?.maxDurationMs
+    ?? (Number.isFinite(envParsed) && envParsed >= 0 ? envParsed : DEFAULT_EMBED_MAX_DURATION_MS);
+
   // Create a session manager for this llm instance
   const result = await withLLMSessionForLlm(llm, async (session) => {
     let chunksEmbedded = 0;
     let bytesProcessed = 0;
     let totalChunks = 0;
     let vectorTableInitialized = false;
-    const BATCH_SIZE = 32;
+    // Chunks per embedBatch call. Follows QMD_REMOTE_BATCH_SIZE (default 32) so
+    // that one store-level batch maps to exactly one HTTP request on remote backends.
+    const BATCH_SIZE = resolveEmbedBatchSize();
+    // How many embedBatch calls may be in flight at once (QMD_EMBED_CONCURRENCY, default 1).
+    const embedConcurrency = resolveEmbedConcurrency();
     const RETRY_AFTER_SUCCESSFUL_CHUNKS = 64;
     const MAX_RETRY_ATTEMPTS = 3;
     const failures = new Map<string, EmbedFailure>();
@@ -1848,26 +1872,16 @@ export async function generateEmbeddings(
       const totalBatchChunkBytes = batchChunks.reduce((sum, chunk) => sum + chunk.bytes, 0);
       let batchChunkBytesProcessed = 0;
 
+      // Split into embed batches and dispatch through a bounded worker pool.
+      // With embedConcurrency=1 (default) this is exactly the old sequential loop.
+      const chunkBatches: ChunkItem[][] = [];
       for (let batchStart = 0; batchStart < batchChunks.length; batchStart += BATCH_SIZE) {
-        // Abort early if session has been invalidated (e.g. max duration exceeded)
-        if (!session.isValid) {
-          const remainingChunks = batchChunks.slice(batchStart);
-          for (const chunk of remainingChunks) recordFailure(chunk, "LLM session expired before embedding chunk");
-          console.warn(`⚠ Session expired — skipping ${remainingChunks.length} remaining chunks`);
-          break;
-        }
+        chunkBatches.push(batchChunks.slice(batchStart, Math.min(batchStart + BATCH_SIZE, batchChunks.length)));
+      }
 
-        // Abort early if active error rate is too high (>80% of attempted chunks failed)
-        const processed = chunksEmbedded + activeErrorCount();
-        if (processed >= BATCH_SIZE && activeErrorCount() > processed * 0.8) {
-          const remainingChunks = batchChunks.slice(batchStart);
-          for (const chunk of remainingChunks) recordFailure(chunk, "embedding aborted because error rate was too high");
-          console.warn(`⚠ Error rate too high (${activeErrorCount()}/${processed}) — aborting embedding`);
-          break;
-        }
+      let abortReason: "session-expired" | "error-rate" | null = null;
 
-        const batchEnd = Math.min(batchStart + BATCH_SIZE, batchChunks.length);
-        const chunkBatch = batchChunks.slice(batchStart, batchEnd);
+      const embedOneBatch = async (chunkBatch: ChunkItem[]): Promise<true> => {
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
         try {
@@ -1914,6 +1928,47 @@ export async function generateEmbeddings(
           errors: activeErrorCount(),
           failures: failureList(),
         });
+        return true;
+      };
+
+      const dispatched = await mapWithConcurrency(
+        chunkBatches,
+        embedConcurrency,
+        embedOneBatch,
+        // Checked before each batch dispatch — stops dispatching new batches
+        // when the session dies or the error rate explodes.
+        () => {
+          // Abort early if session has been invalidated (e.g. max duration exceeded)
+          if (!session.isValid) {
+            abortReason = "session-expired";
+            return false;
+          }
+          // Abort early if error rate is too high (>80% of processed chunks failed)
+          const processed = chunksEmbedded + activeErrorCount();
+          if (processed >= BATCH_SIZE && activeErrorCount() > processed * 0.8) {
+            abortReason = "error-rate";
+            return false;
+          }
+          return true;
+        },
+      );
+
+      if (abortReason) {
+        const abortMessage = abortReason === "session-expired"
+          ? "LLM session expired before embedding chunk"
+          : "embedding aborted because error rate was too high";
+        let remaining = 0;
+        for (let i = 0; i < chunkBatches.length; i++) {
+          if (dispatched[i] === undefined) {
+            for (const chunk of chunkBatches[i]!) recordFailure(chunk, abortMessage);
+            remaining += chunkBatches[i]!.length;
+          }
+        }
+        if (abortReason === "session-expired") {
+          console.warn(`⚠ Session expired — skipping ${remaining} remaining chunks`);
+        } else {
+          console.warn(`⚠ Error rate too high (${activeErrorCount()}/${chunksEmbedded + activeErrorCount()}) — aborting embedding`);
+        }
       }
 
       await retryFailedChunks(true);
@@ -1928,7 +1983,7 @@ export async function generateEmbeddings(
     }
 
     return { chunksEmbedded, errors: activeErrorCount(), failures: failureList() };
-  }, { maxDuration: options?.maxDurationMs ?? DEFAULT_EMBED_MAX_DURATION_MS, name: 'generateEmbeddings' });
+  }, { maxDuration: sessionMaxMs, name: 'generateEmbeddings' });
 
   return {
     docsProcessed: totalDocs,
@@ -2769,7 +2824,10 @@ export async function chunkDocumentByTokens(
   chunkStrategy: ChunkStrategy = "regex",
   signal?: AbortSignal
 ): Promise<{ text: string; pos: number; tokens: number }[]> {
-  const llm = getDefaultLlamaCpp();
+  const llm = getDefaultLLM();
+
+  // Check if the LLM supports tokenization (LlamaCpp does, RemoteLLM doesn't)
+  const canTokenize = typeof (llm as any).tokenize === "function";
 
   // Use moderate chars/token estimate (prose ~4, code ~2, mixed ~3)
   // If chunks exceed limit, they'll be re-split with actual ratio
@@ -3762,13 +3820,39 @@ export async function searchVec(db: Database, query: string, model: string, limi
 // Embeddings
 // =============================================================================
 
-async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LlamaCpp): Promise<number[] | null> {
+async function getEmbedding(text: string, model: string, isQuery: boolean, session?: ILLMSession, llmOverride?: LLM): Promise<number[] | null> {
   // Format text using the appropriate prompt template
   const formattedText = isQuery ? formatQueryForEmbedding(text, model) : formatDocForEmbedding(text, undefined, model);
   const result = session
     ? await session.embed(formattedText, { model, isQuery })
-    : await (llmOverride ?? getDefaultLlamaCpp()).embed(formattedText, { model, isQuery });
+    : await (llmOverride ?? getDefaultLLM()).embed(formattedText, { model, isQuery });
   return result?.embedding || null;
+}
+
+/**
+ * Rerank with graceful degradation. If the configured LLM has no reranker
+ * available (e.g. a remote embed provider like Gemini with no rerank endpoint,
+ * or no local reranker GGUF), fall back to reranker-scores derived from the
+ * candidate (RRF) order instead of throwing. Hybrid search then still returns
+ * RRF-ranked results rather than failing the whole query.
+ */
+async function rerankOrFallback(
+  store: Store,
+  query: string,
+  chunks: { file: string; text: string }[],
+  intent?: string,
+): Promise<{ file: string; score: number }[]> {
+  try {
+    return await store.rerank(query, chunks, undefined, intent);
+  } catch (err) {
+    const msg = err instanceof Error ? err.message : String(err);
+    if (/rerank/i.test(msg)) {
+      // Synthesize reranker scores from candidate order (already RRF-sorted),
+      // so downstream blending preserves the retrieval ranking.
+      return chunks.map((c, i) => ({ file: c.file, score: 1 / (i + 1) }));
+    }
+    throw err;
+  }
 }
 
 /**
@@ -3922,7 +4006,7 @@ function removeIncompleteEmbeddings(db: Database, expectedChunksByHash: Map<stri
 // Query expansion
 // =============================================================================
 
-export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<ExpandedQuery[]> {
+export async function expandQuery(query: string, model: string = DEFAULT_QUERY_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<ExpandedQuery[]> {
   // Check cache first — stored as JSON preserving types
   const cacheKey = getCacheKey("expandQuery", { query, model, ...(intent && { intent }) });
   const cached = getCachedResult(db, cacheKey);
@@ -3942,7 +4026,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
     }
   }
 
-  const llm = llmOverride ?? getDefaultLlamaCpp();
+  const llm = llmOverride ?? getDefaultLLM();
   // Note: LlamaCpp uses hardcoded model, model parameter is ignored
   const results = await llm.expandQuery(query, { intent });
 
@@ -3963,7 +4047,7 @@ export async function expandQuery(query: string, model: string = DEFAULT_QUERY_M
 // Reranking
 // =============================================================================
 
-export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LlamaCpp): Promise<{ file: string; score: number }[]> {
+export async function rerank(query: string, documents: { file: string; text: string }[], model: string = DEFAULT_RERANK_MODEL, db: Database, intent?: string, llmOverride?: LLM): Promise<{ file: string; score: number }[]> {
   // Prepend intent to rerank query so the reranker scores with domain context
   const rerankQuery = intent ? `${intent}\n\n${query}` : query;
 
@@ -3988,7 +4072,7 @@ export async function rerank(query: string, documents: { file: string; text: str
 
   // Rerank uncached documents using LlamaCpp
   if (uncachedDocsByChunk.size > 0) {
-    const llm = llmOverride ?? getDefaultLlamaCpp();
+    const llm = llmOverride ?? getDefaultLLM();
     const uncachedDocs = [...uncachedDocsByChunk.values()];
     const rerankResult = await llm.rerank(rerankQuery, uncachedDocs, { model });
 
@@ -4982,7 +5066,7 @@ export async function hybridQuery(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart = Date.now();
-  const reranked = await store.rerank(query, chunksToRerank, undefined, intent);
+  const reranked = await rerankOrFallback(store, query, chunksToRerank, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart);
 
   // Step 7: Blend RRF position score with reranker score
@@ -5380,7 +5464,7 @@ export async function structuredSearch(
 
   hooks?.onRerankStart?.(chunksToRerank.length);
   const rerankStart2 = Date.now();
-  const reranked = await store.rerank(primaryQuery, chunksToRerank, undefined, intent);
+  const reranked = await rerankOrFallback(store, primaryQuery, chunksToRerank, intent);
   hooks?.onRerankDone?.(Date.now() - rerankStart2);
 
   // Step 6: Blend RRF position score with reranker score
