@@ -1,12 +1,16 @@
 /**
  * store-cjk-fts.test.ts — Regression tests for the CJK FTS migration fix.
  *
- * Covers rebuildFTSForCjkNormalization()'s streaming, batched, shadow-table
- * rebuild (src/store.ts). The previous implementation cleared documents_fts up
+ * Covers rebuildFTSForCjkNormalization()'s paginated, batched, shadow-table
+ * rebuild (src/store.ts). An earlier implementation cleared documents_fts up
  * front, loaded every document body into memory via .all() inside a single
- * giant transaction, and left FTS empty on a mid-rebuild crash. The new
- * implementation:
- *   - streams source rows via .iterate() (never materializes all bodies),
+ * giant transaction, and left FTS empty on a mid-rebuild crash. A follow-up
+ * streamed rows via a live .iterate() cursor, but holding that cursor open
+ * across the per-batch db.transaction() flush made better-sqlite3 throw
+ * "database connection is busy executing a query" once the first batch filled
+ * on a large index (the prod CJK-rebuild crash). The current implementation:
+ *   - reads source rows one bounded page at a time via LIMIT + keyset (id > ?)
+ *     pagination (no whole-corpus materialization, no live cursor during writes),
  *   - builds a separate documents_fts_rebuild shadow table in batches,
  *   - atomically swaps it in only after a complete pass,
  *   - drops a lingering shadow table from a prior crashed run on the next run.
@@ -134,11 +138,11 @@ function activeDocCount(db: Database): number {
 }
 
 // =============================================================================
-// Test 1 — structural: rebuild streams via .iterate(), never .all()
+// Test 1 — structural: rebuild reads bounded pages, never holds a live cursor
 // =============================================================================
 
-describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
-  test("body scan uses .iterate(), not .all()", () => {
+describe("rebuildFTSForCjkNormalization — paginated source scan", () => {
+  test("body scan pages via LIMIT + keyset, never a live .iterate() cursor", () => {
     const __filename = fileURLToPath(import.meta.url);
     const storeSrc = readFileSync(
       join(dirname(__filename), "..", "src", "store.ts"),
@@ -146,7 +150,7 @@ describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
     );
 
     // Isolate the migration function body so the assertion can't be satisfied
-    // by an unrelated .all()/.iterate() elsewhere in the 4000-line file.
+    // by an unrelated .all()/.iterate() elsewhere in the 5000-line file.
     const startIdx = storeSrc.indexOf("function rebuildFTSForCjkNormalization(");
     expect(startIdx).toBeGreaterThan(-1);
     // initializeDatabase() is the next top-level function after the migration.
@@ -155,18 +159,22 @@ describe("rebuildFTSForCjkNormalization — streaming source scan", () => {
     const fnBodyRaw = storeSrc.slice(startIdx, endIdx);
 
     // Strip line + block comments so the assertions match real executed code,
-    // not the narrative comment that mentions the old `.all()` behavior.
+    // not the narrative comment that mentions the old cursor behavior.
     const fnBody = fnBodyRaw
       .replace(/\/\*[\s\S]*?\*\//g, "")
       .split("\n")
       .map(line => line.replace(/\/\/.*$/, ""))
       .join("\n");
 
-    // The source-row scan must stream one row at a time.
-    expect(fnBody).toMatch(/\.iterate</);
-    // It must NOT pull the whole result set (every document body) into a JS
-    // array — that is the OOM regression this fix removes.
-    expect(fnBody).not.toMatch(/\.all\(/);
+    // It must NOT hold a live .iterate() read cursor open across the batched
+    // writes: better-sqlite3 reports "database connection is busy executing a
+    // query" when a db.transaction() flush runs while an iterator is active,
+    // which crashed the prod CJK rebuild on a large index.
+    expect(fnBody).not.toMatch(/\.iterate\b/);
+    // Instead it must read one bounded page at a time — LIMIT + keyset (id > ?)
+    // pagination — fully draining each page's read statement before writing.
+    expect(fnBody).toMatch(/LIMIT/);
+    expect(fnBody).toMatch(/d\.id > \?/);
     // Sanity: it builds into a shadow table and atomically swaps it in via
     // INSERT INTO … SELECT (not ALTER TABLE … RENAME, which triggers SQLite
     // 3.25+ re-validation of dependent trigger bodies).
@@ -246,6 +254,63 @@ describe("rebuildFTSForCjkNormalization — large-library full migration", () =>
       ).get();
       // bun:sqlite .get() returns null, better-sqlite3 returns undefined for no-row.
       expect(shadow ?? undefined).toBeUndefined();
+    } finally {
+      store.close();
+    }
+  });
+
+  test("migrates a library larger than BATCH_SIZE without a busy-connection crash", async () => {
+    // BATCH_SIZE inside rebuildFTSForCjkNormalization is 500. Cross it multiple
+    // times so the rebuild flushes several full batches mid-scan. The previous
+    // live-.iterate() implementation threw "database connection is busy
+    // executing a query" the first time db.transaction(flushBatch) ran while the
+    // source cursor was still open — i.e. exactly here, once >500 rows exist.
+    // The 60-doc test above never crossed a batch boundary, so it could not
+    // surface this regression.
+    const DOC_COUNT = 1100;
+    {
+      const seed = openDatabase(dbPath);
+      createBaseSchema(seed);
+      const insertContent = seed.prepare(`INSERT OR IGNORE INTO content (hash, doc, created_at) VALUES (?, ?, ?)`);
+      const insertDoc = seed.prepare(`
+        INSERT INTO documents (id, collection, path, title, hash, created_at, modified_at, active)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 1)
+      `);
+      const now = new Date().toISOString();
+      // Seed inside one transaction to keep this fast.
+      const seedAll = seed.transaction(() => {
+        for (let i = 1; i <= DOC_COUNT; i++) {
+          const hash = `hash-${i}`;
+          insertContent.run(hash, `body content for row ${i} token-${i}`, now);
+          insertDoc.run(i, "big", `doc-${i}.md`, `Document ${i}`, hash, now, now);
+        }
+      });
+      seedAll();
+      expect(ftsRowCount(seed)).toBe(0);
+      seed.close();
+    }
+
+    const store = createStore(dbPath);
+    try {
+      const db = store.db;
+      const ver = db.prepare(
+        `SELECT value FROM store_config WHERE key = 'fts_cjk_normalized_version'`
+      ).get() as { value?: string } | undefined;
+      expect(ver?.value).toBe(FTS_CJK_NORMALIZED_VERSION);
+
+      // Every active doc across all batches got indexed exactly once.
+      expect(ftsRowCount(db)).toBe(activeDocCount(db));
+      expect(ftsRowCount(db)).toBe(DOC_COUNT);
+
+      // A token from a doc past the first batch boundary is searchable.
+      const hits = store.searchFTS("token-900", 10, "big");
+      expect(hits.length).toBe(1);
+      expect(hits[0]!.displayPath).toBe("big/doc-900.md");
+
+      const shadows = db.prepare(
+        `SELECT name FROM sqlite_master WHERE name LIKE 'documents_fts_rebuild%'`
+      ).all() as { name: string }[];
+      expect(shadows).toHaveLength(0);
     } finally {
       store.close();
     }

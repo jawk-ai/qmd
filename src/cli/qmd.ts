@@ -80,7 +80,7 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
 import { RemoteLLM, remoteConfigFromEnv } from "../remote-llm.js";
 import { HybridLLM } from "../hybrid-llm.js";
 import {
@@ -322,7 +322,7 @@ function formatETA(seconds: number): string {
 
 
 // Check index health and print warnings/tips
-function checkIndexHealth(db: Database, model: string = resolveEmbedModelForCli()): void {
+function checkIndexHealth(db: Database, model: string = resolveEmbedModelKeyForCli()): void {
   const { needsEmbedding, totalDocs, daysStale } = getIndexHealth(db, model);
 
   // Warn if many docs need embedding
@@ -495,7 +495,10 @@ async function showStatus(): Promise<void> {
   // Overall stats
   const totalDocs = db.prepare(`SELECT COUNT(*) as count FROM documents WHERE active = 1`).get() as { count: number };
   const vectorCount = db.prepare(`SELECT COUNT(*) as count FROM content_vectors`).get() as { count: number };
-  const statusEmbedModel = resolveEmbedModelForCli();
+  // Use the key embeddings are actually stored under (remote model id under a
+  // hybrid/remote backend), not the local GGUF URI — otherwise a fully-embedded
+  // remote index reports every document as pending.
+  const statusEmbedModel = resolveEmbedModelKeyForCli();
   const needsEmbedding = getHashesNeedingEmbedding(db, undefined, statusEmbedModel);
 
   // Most recent update across all collections
@@ -1857,6 +1860,23 @@ function ensureModelsConfiguredForCli(): { embed: string; generate: string; rera
 
 export function resolveEmbedModelForCli(): string {
   return ensureModelsConfiguredForCli().embed;
+}
+
+/**
+ * Model KEY used to query embedding state in content_vectors (status, doctor,
+ * index-health, vector-index freshness).
+ *
+ * Embeddings are stored keyed by the model that actually produced them —
+ * getDefaultLLM().embedModelName. With a remote/hybrid embed backend that is
+ * the remote model id (e.g. a Gemini/OpenAI id), NOT the local GGUF URI that
+ * resolveEmbedModelForCli() returns. Querying content_vectors with the GGUF URI
+ * finds zero rows against a fully-embedded remote index and falsely reports
+ * "all documents need embedding" / a stale index. Callers must have
+ * initialized the store (getStore()) first so the configured LLM is set;
+ * otherwise this falls back to a default local LlamaCpp's model name.
+ */
+function resolveEmbedModelKeyForCli(): string {
+  return getDefaultLLM().embedModelName;
 }
 
 export function resolveGenerateModelForCli(): string {
@@ -3745,13 +3765,25 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
     return;
   }
 
+  // The device probe is a local llama.cpp capability. When a remote/hybrid embed
+  // backend is configured, getDefaultLLM() is a HybridLLM (or RemoteLLM) that has
+  // no getDeviceInfo() — the old `as LlamaCpp` cast crashed here with "getDeviceInfo
+  // is not a function". Resolve the local leg (HybridLLM still runs generate/tokenize
+  // on it) and skip gracefully if there is genuinely no local llama.cpp backend.
+  const defaultLlm = getDefaultLLM();
+  const localLlm = defaultLlm instanceof HybridLLM ? defaultLlm.localLlm : defaultLlm;
+  if (!(localLlm instanceof LlamaCpp)) {
+    doctorCheck("device probe", true, "skipped — embeddings use a remote backend and no local llama.cpp device is configured");
+    return;
+  }
+
   const crashHint = "Probing native llama backend now. If qmd crashes here, rerun with `QMD_FORCE_CPU=1 qmd doctor` (or `QMD_DOCTOR_DEVICE_PROBE=0 qmd doctor` to skip this probe).";
   if (process.stdout.isTTY) {
     process.stdout.write(`${c.dim}${crashHint}${c.reset}`);
   }
 
   try {
-    const device = await (getDefaultLlamaCpp() as LlamaCpp).getDeviceInfo({ allowBuild: false });
+    const device = await localLlm.getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
@@ -3817,7 +3849,12 @@ async function showDoctor(): Promise<void> {
   const db = storeInstance.db;
   const pkg = readPackageJson();
   const activeModels = resolveModelsForCli();
-  const embedModel = activeModels.embed;
+  // getStore() above configured the default LLM; content_vectors is keyed by the
+  // model that actually produced the embeddings (remote id under a hybrid/remote
+  // backend), so all embedding-state/fingerprint checks below must use that key
+  // rather than activeModels.embed (the local GGUF URI). activeModels stays for
+  // the local model-cache / env / defaults checks.
+  const embedModel = resolveEmbedModelKeyForCli();
   const fingerprint = getEmbeddingFingerprint(embedModel);
   const nextSteps: string[] = [];
 

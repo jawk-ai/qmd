@@ -32,6 +32,16 @@ export class HybridLLM implements LLM {
     return this.remote.embedModelName;
   }
 
+  /**
+   * The local backend leg (LlamaCpp in normal wiring). Exposed so callers that
+   * need a local-only capability — e.g. `qmd doctor`'s llama.cpp device probe —
+   * can reach the underlying local LLM instead of crashing on the composite,
+   * which has no getDeviceInfo(). Generation/tokenize still route here too.
+   */
+  get localLlm(): LLM {
+    return this.local;
+  }
+
   // Generation routes to local; rerank routes to remote. Expose the matching
   // backend's model name so query-time model resolution keeps using the
   // configured local/remote models rather than falling back to defaults.
