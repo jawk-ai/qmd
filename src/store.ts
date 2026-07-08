@@ -30,6 +30,7 @@ import {
   type LLM,
   type RerankDocument,
   type ILLMSession,
+  type EmbeddingResult,
 } from "./llm.js";
 import type {
   NamedCollection,
@@ -38,6 +39,7 @@ import type {
   ContextMap,
 } from "./collections.js";
 import {
+  AsyncMutex,
   mapWithConcurrency,
   resolveEmbedConcurrency,
   resolveEmbedBatchSize,
@@ -912,23 +914,30 @@ function rebuildFTSForCjkNormalization(db: Database): void {
       }
     });
 
-    // .iterate() pulls rows one at a time from SQLite rather than materializing
-    // the entire result set (every document body) into a JS array up front.
-    const iterator = db.prepare(`
+    // Read the source rows one bounded page at a time via keyset pagination
+    // (id > lastId ... LIMIT). We must NOT hold a live .iterate() cursor open
+    // while flushing: better-sqlite3 keeps the connection "busy executing a
+    // query" for the duration of an open iterator, so the per-batch
+    // db.transaction() flush below would throw "This database connection is
+    // busy executing a query" once the first batch fills (>BATCH_SIZE rows) on
+    // a large index — the prod CJK-rebuild crash on the 3GB index. .all() fully
+    // drains each page's read statement before any write starts, and the page
+    // is bounded to BATCH_SIZE rows so memory stays flat (no whole-corpus
+    // materialization). Keyset (not OFFSET) keeps each page an index seek.
+    const selectPage = db.prepare(`
       SELECT d.id, d.collection, d.path, d.title, content.doc as body
       FROM documents d
       JOIN content ON content.hash = d.hash
-      WHERE d.active = 1
-    `).iterate<FtsRow>();
+      WHERE d.active = 1 AND d.id > ?
+      ORDER BY d.id
+      LIMIT ?
+    `);
 
-    for (const row of iterator) {
-      batch.push(row);
-      if (batch.length >= BATCH_SIZE) {
-        flushBatch();
-        batch = [];
-      }
-    }
-    if (batch.length > 0) {
+    let lastId = 0;
+    for (;;) {
+      batch = selectPage.all(lastId, BATCH_SIZE) as FtsRow[];
+      if (batch.length === 0) break;
+      lastId = batch[batch.length - 1]!.id;
       flushBatch();
     }
 
@@ -1742,6 +1751,16 @@ export async function generateEmbeddings(
     const failures = new Map<string, EmbedFailure>();
     const retryQueue = new Map<string, ChunkItem>();
     let successesSinceRetry = 0;
+    // Serializes every mutation of the shared bookkeeping above (chunksEmbedded,
+    // successesSinceRetry, failures, retryQueue, batchChunkBytesProcessed) plus
+    // the retry passes. When QMD_EMBED_CONCURRENCY > 1, multiple embedOneBatch
+    // workers run concurrently; without this lock two workers could interleave
+    // at an await and, most damagingly, both drain the same retryQueue entries —
+    // double-counting chunks and re-issuing embeds. Only the network embed calls
+    // stay outside the lock (concurrent throughput); the fast synchronous
+    // bookkeeping and the rare retry network calls run exclusively. With
+    // concurrency=1 the lock is always uncontended (identical to the old loop).
+    const stateLock = new AsyncMutex();
 
     const failureList = () => [...failures.values()];
     const activeErrorCount = () => failures.size;
@@ -1884,49 +1903,64 @@ export async function generateEmbeddings(
       const embedOneBatch = async (chunkBatch: ChunkItem[]): Promise<true> => {
         const texts = chunkBatch.map(chunk => formatDocForEmbedding(chunk.text, chunk.title, embedModelUri));
 
+        // Do the (slow) network embed OUTSIDE the lock so multiple workers can
+        // have requests in flight concurrently. batchError is captured so the
+        // fallback runs under the lock, alongside all other shared-state writes.
+        let embeddings: (EmbeddingResult | null)[] | undefined;
+        let batchError: unknown;
         try {
-          const embeddings = await session.embedBatch(texts, { model });
-          for (let i = 0; i < chunkBatch.length; i++) {
-            const chunk = chunkBatch[i]!;
-            const embedding = embeddings[i];
-            if (embedding) {
-              insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
-              chunksEmbedded++;
-              successesSinceRetry++;
-              clearFailure(chunk);
-            } else {
-              recordFailure(chunk, "batch embedding returned no vector");
-            }
-            batchChunkBytesProcessed += chunk.bytes;
-          }
-          await retryFailedChunks();
+          embeddings = await session.embedBatch(texts, { model });
         } catch (error) {
-          // Batch failed — try individual embeddings as fallback. If an
-          // individual retry succeeds, any prior failure for that chunk is
-          // cleared, so the visible error count reflects outstanding failures.
-          const batchReason = reasonFromError(error);
-          if (!session.isValid) {
-            for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
-            batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
-          } else {
-            for (const chunk of chunkBatch) {
-              await tryEmbedChunk(chunk);
-              batchChunkBytesProcessed += chunk.bytes;
-              await retryFailedChunks();
-            }
-          }
+          batchError = error;
         }
 
-        const proportionalBytes = totalBatchChunkBytes === 0
-          ? batchBytes
-          : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
-        options?.onProgress?.({
-          chunksEmbedded,
-          totalChunks,
-          bytesProcessed: bytesProcessed + proportionalBytes,
-          totalBytes,
-          errors: activeErrorCount(),
-          failures: failureList(),
+        // Everything below mutates shared bookkeeping (counters, failures,
+        // retryQueue, byte accounting) and/or issues serialized retry embeds, so
+        // it runs under the mutex — one worker at a time, start to finish.
+        await stateLock.runExclusive(async () => {
+          if (batchError === undefined && embeddings) {
+            for (let i = 0; i < chunkBatch.length; i++) {
+              const chunk = chunkBatch[i]!;
+              const embedding = embeddings[i];
+              if (embedding) {
+                insertEmbedding(db, chunk.hash, chunk.seq, chunk.pos, new Float32Array(embedding.embedding), model, now, chunk.expectedTotalChunks, fingerprint);
+                chunksEmbedded++;
+                successesSinceRetry++;
+                clearFailure(chunk);
+              } else {
+                recordFailure(chunk, "batch embedding returned no vector");
+              }
+              batchChunkBytesProcessed += chunk.bytes;
+            }
+            await retryFailedChunks();
+          } else {
+            // Batch failed — try individual embeddings as fallback. If an
+            // individual retry succeeds, any prior failure for that chunk is
+            // cleared, so the visible error count reflects outstanding failures.
+            const batchReason = reasonFromError(batchError);
+            if (!session.isValid) {
+              for (const chunk of chunkBatch) recordFailure(chunk, `batch failed and session expired: ${batchReason}`);
+              batchChunkBytesProcessed += chunkBatch.reduce((sum, c) => sum + c.bytes, 0);
+            } else {
+              for (const chunk of chunkBatch) {
+                await tryEmbedChunk(chunk);
+                batchChunkBytesProcessed += chunk.bytes;
+                await retryFailedChunks();
+              }
+            }
+          }
+
+          const proportionalBytes = totalBatchChunkBytes === 0
+            ? batchBytes
+            : Math.min(batchBytes, Math.round((batchChunkBytesProcessed / totalBatchChunkBytes) * batchBytes));
+          options?.onProgress?.({
+            chunksEmbedded,
+            totalChunks,
+            bytesProcessed: bytesProcessed + proportionalBytes,
+            totalBytes,
+            errors: activeErrorCount(),
+            failures: failureList(),
+          });
         });
         return true;
       };
@@ -1971,7 +2005,9 @@ export async function generateEmbeddings(
         }
       }
 
-      await retryFailedChunks(true);
+      // Runs after all batch workers for this doc-batch have settled, but take
+      // the lock anyway so it can never overlap a still-in-flight retry pass.
+      await stateLock.runExclusive(() => retryFailedChunks(true));
 
       const removedPartialChunks = removeIncompleteEmbeddings(db, expectedChunksByHash, model);
       if (removedPartialChunks > 0) {

@@ -222,28 +222,55 @@ export class RemoteLLM implements LLM {
       }
 
       const json = await response.json() as {
-        data: { embedding: number[]; index: number }[];
+        data?: { embedding?: number[]; index?: number }[];
       };
+      const data = Array.isArray(json.data) ? json.data : [];
 
-      // Validate dimensions consistency
-      if (json.data.length > 0) {
-        const dim = json.data[0]!.embedding.length;
+      // Place each embedding at its declared `index` so the returned array lines
+      // up positionally with `texts` regardless of response ordering. The caller
+      // maps results[i] → chunk[i], so a response that reorders, drops, or
+      // duplicates items would otherwise silently store the WRONG vector for a
+      // chunk. Validate every vector's dimension (not just the first) and that
+      // the response covers every input index exactly once.
+      const results: (EmbeddingResult | null)[] = new Array(texts.length).fill(null);
+      const seenIndices = new Set<number>();
+
+      for (const item of data) {
+        const idx = item?.index;
+        if (!Number.isInteger(idx) || (idx as number) < 0 || (idx as number) >= texts.length) {
+          throw new Error(
+            `Embedding API returned an out-of-range index ${idx} for a batch of ${texts.length} input(s).`
+          );
+        }
+        const index = idx as number;
+        if (seenIndices.has(index)) {
+          throw new Error(`Embedding API returned a duplicate index ${index}.`);
+        }
+
+        const embedding = item?.embedding;
+        const dim = Array.isArray(embedding) ? embedding.length : 0;
+        if (dim === 0) {
+          throw new Error(`Embedding API returned a missing or empty vector at index ${index}.`);
+        }
         if (this.expectedDimensions === null) {
           this.expectedDimensions = dim;
         } else if (dim !== this.expectedDimensions) {
           throw new Error(
-            `Embedding dimension mismatch: expected ${this.expectedDimensions}, got ${dim}. ` +
+            `Embedding dimension mismatch at index ${index}: expected ${this.expectedDimensions}, got ${dim}. ` +
             `This usually means the remote model changed.`
           );
         }
+
+        seenIndices.add(index);
+        results[index] = { embedding: embedding as number[], model: this.config.embedApiModel };
       }
 
-      // Sort by index to match input order
-      const sorted = [...json.data].sort((a, b) => a.index - b.index);
-      const results: (EmbeddingResult | null)[] = sorted.map(item => ({
-        embedding: item.embedding,
-        model: this.config.embedApiModel,
-      }));
+      if (seenIndices.size !== texts.length) {
+        throw new Error(
+          `Embedding API returned ${seenIndices.size} vector(s) for ${texts.length} input(s) — ` +
+          `response did not cover every input index.`
+        );
+      }
 
       this.embedBreaker.onSuccess();
       return results;

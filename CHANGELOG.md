@@ -45,6 +45,46 @@
   compatibility). Added a `collections?: string[]` option alongside the legacy
   `collection?: string` on the relevant option types.
 
+### Fixed
+
+- **CJK FTS rebuild no longer crashes on large indexes.**
+  `rebuildFTSForCjkNormalization` held a live `.iterate()` read cursor open while
+  running per-batch `db.transaction()` writes on the same connection. Once the
+  first 500-row batch filled mid-scan, better-sqlite3 threw
+  `This database connection is busy executing a query`, aborting the migration on
+  large indexes (the production crash on the ~3GB index). The rebuild now reads
+  source rows one bounded page at a time via `LIMIT` + keyset (`id > ?`)
+  pagination, fully draining each page's read statement before any write — no
+  open cursor during writes, and memory stays flat.
+- **`qmd status` / `qmd doctor` / index-health report correct embedding state
+  under a remote/hybrid backend.** These paths queried `content_vectors` with the
+  local GGUF model URI (`resolveEmbedModelForCli()`), but embeddings produced by a
+  remote/hybrid backend are stored under the remote model id
+  (`getDefaultLLM().embedModelName`). A fully-embedded remote index therefore
+  reported every document as "needs embedding". Health/status/doctor and the
+  vector-index freshness check now use the model key the vectors are actually
+  stored under.
+- **`qmd doctor` no longer crashes when a remote/hybrid embed backend is
+  configured.** `runDoctorDeviceChecks` cast the default LLM to `LlamaCpp` and
+  called `getDeviceInfo()`, which does not exist on `HybridLLM`/`RemoteLLM`. It now
+  probes the local llama.cpp leg (exposed via `HybridLLM.localLlm`) and skips the
+  probe gracefully when there is no local backend.
+- **Remote embedding validates the full batch response.** `RemoteLLM`'s batch
+  embed only checked the first vector's dimension and mapped results positionally
+  after a sort, so a response that dropped, duplicated, reordered, or wrong-sized a
+  later vector could silently store the wrong embedding for a chunk. Every returned
+  vector's dimension is now validated, each result is placed at its declared
+  `index`, and a response that does not cover every input index (or has an
+  out-of-range/duplicate index) is rejected.
+- **Concurrent embedding (`QMD_EMBED_CONCURRENCY > 1`) no longer corrupts shared
+  counters.** `generateEmbeddings` mutated shared bookkeeping (`chunksEmbedded`,
+  the failure map, and the retry queue) from multiple in-flight batch workers;
+  overlapping retry passes could drain the same retry-queue entries, double-count
+  chunks, and re-issue embeds. Shared-state mutation and retry passes now run under
+  a small async mutex while the network embed calls stay concurrent. With the
+  default `QMD_EMBED_CONCURRENCY=1` the lock is always uncontended (no behavior
+  change).
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

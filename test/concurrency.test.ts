@@ -4,6 +4,7 @@
 
 import { describe, it, expect, afterEach } from "vitest";
 import {
+  AsyncMutex,
   mapWithConcurrency,
   resolveEmbedConcurrency,
   resolveEmbedBatchSize,
@@ -108,6 +109,62 @@ describe("mapWithConcurrency", () => {
       active--;
     });
     expect(maxActive).toBe(1);
+  });
+});
+
+describe("AsyncMutex", () => {
+  it("serializes critical sections that span an await (no interleaving)", async () => {
+    const mutex = new AsyncMutex();
+    const events: string[] = [];
+
+    // Each section does read → await → write on a shared counter. Without the
+    // lock the awaits interleave and both read the same value (a lost update);
+    // with the lock every section runs start-to-finish before the next.
+    let shared = 0;
+    const section = async (label: string) => {
+      await mutex.runExclusive(async () => {
+        events.push(`enter-${label}`);
+        const seen = shared;
+        await sleep(5);
+        shared = seen + 1;
+        events.push(`exit-${label}`);
+      });
+    };
+
+    await Promise.all([section("a"), section("b"), section("c")]);
+
+    expect(shared).toBe(3); // no lost updates
+    // No two sections overlap: every enter is immediately followed by its exit.
+    for (let i = 0; i < events.length; i += 2) {
+      expect(events[i]!.replace("enter-", "")).toBe(events[i + 1]!.replace("exit-", ""));
+    }
+  });
+
+  it("releases the lock in FIFO acquisition order", async () => {
+    const mutex = new AsyncMutex();
+    const order: number[] = [];
+    const tasks = [0, 1, 2, 3, 4].map(i =>
+      mutex.runExclusive(async () => {
+        order.push(i);
+        await sleep(1);
+      }),
+    );
+    await Promise.all(tasks);
+    expect(order).toEqual([0, 1, 2, 3, 4]);
+  });
+
+  it("releases the lock even when the callback throws", async () => {
+    const mutex = new AsyncMutex();
+    await expect(mutex.runExclusive(async () => { throw new Error("boom"); })).rejects.toThrow("boom");
+    // Lock must still be acquirable afterwards.
+    const result = await mutex.runExclusive(async () => 42);
+    expect(result).toBe(42);
+  });
+
+  it("returns the callback result", async () => {
+    const mutex = new AsyncMutex();
+    expect(await mutex.runExclusive(() => "sync-value")).toBe("sync-value");
+    expect(await mutex.runExclusive(async () => "async-value")).toBe("async-value");
   });
 });
 

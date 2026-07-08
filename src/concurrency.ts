@@ -49,6 +49,41 @@ function parsePositiveIntEnv(name: string, defaultValue: number): number {
  *
  * With concurrency=1 this is exactly a sequential for-await loop.
  */
+/**
+ * Minimal FIFO async mutex.
+ *
+ * Serializes access to shared mutable state across concurrent async workers
+ * (e.g. the embed pipeline's counters, failure map, and retry queue when
+ * QMD_EMBED_CONCURRENCY > 1). JavaScript never preempts synchronous code, but
+ * an `await` inside a critical section yields the event loop, letting another
+ * worker observe/mutate half-updated shared state or re-process the same
+ * retry-queue entry. `runExclusive` guarantees at most one holder runs its
+ * callback to completion (including across its internal awaits) before the next
+ * waiter starts. With a single worker the lock is always uncontended.
+ */
+export class AsyncMutex {
+  private tail: Promise<void> = Promise.resolve();
+
+  /**
+   * Run `fn` while holding the lock. Waiters are released in FIFO order. The
+   * lock is always released, even if `fn` throws (the rejection propagates to
+   * the caller).
+   */
+  async runExclusive<T>(fn: () => Promise<T> | T): Promise<T> {
+    // Chain onto the current tail so callers acquire the lock in arrival order.
+    const previous = this.tail;
+    let release!: () => void;
+    this.tail = new Promise<void>(resolve => { release = resolve; });
+
+    await previous;
+    try {
+      return await fn();
+    } finally {
+      release();
+    }
+  }
+}
+
 export async function mapWithConcurrency<T, R>(
   items: readonly T[],
   concurrency: number,

@@ -222,6 +222,88 @@ describe("RemoteLLM", () => {
       // Second call should fail because dimensions changed
       await expect(llm.embed("second")).rejects.toThrow("dimension mismatch");
     });
+
+    it("rejects a dimension mismatch on a NON-first vector within one batch", async () => {
+      // Only the first vector matched the expected dimension in the old code;
+      // a mismatched later vector slipped through. All vectors must be checked.
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          data: [
+            { embedding: [1.0, 2.0, 3.0], index: 0 },
+            { embedding: [1.0, 2.0], index: 1 }, // wrong dim
+            { embedding: [1.0, 2.0, 3.0], index: 2 },
+          ],
+        },
+      }));
+
+      const llm = createRemoteLLM();
+      await expect(llm.embedBatch(["a", "b", "c"])).rejects.toThrow("dimension mismatch at index 1");
+    });
+  });
+
+  describe("response coverage validation", () => {
+    it("rejects a response that omits an input index (misalignment guard)", async () => {
+      // Returning fewer items than inputs used to silently truncate + misalign
+      // (chunk 2 would get chunk 3's vector). Must throw instead.
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          data: [
+            { embedding: [0.1], index: 0 },
+            { embedding: [0.1], index: 1 },
+            { embedding: [0.1], index: 3 }, // index 2 missing
+          ],
+        },
+      }));
+
+      const llm = createRemoteLLM();
+      await expect(llm.embedBatch(["a", "b", "c", "d"])).rejects.toThrow("did not cover every input index");
+    });
+
+    it("rejects an out-of-range index", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: { data: [{ embedding: [0.1], index: 5 }] },
+      }));
+
+      const llm = createRemoteLLM();
+      await expect(llm.embedBatch(["a"])).rejects.toThrow("out-of-range index");
+    });
+
+    it("rejects a duplicate index", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          data: [
+            { embedding: [0.1], index: 0 },
+            { embedding: [0.2], index: 0 },
+          ],
+        },
+      }));
+
+      const llm = createRemoteLLM();
+      await expect(llm.embedBatch(["a", "b"])).rejects.toThrow("duplicate index");
+    });
+
+    it("places every vector at its declared index even when reordered", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: {
+          data: [
+            { embedding: [0.2], index: 1 },
+            { embedding: [0.0], index: 0 },
+            { embedding: [0.3], index: 2 },
+          ],
+        },
+      }));
+
+      const llm = createRemoteLLM();
+      const results = await llm.embedBatch(["a", "b", "c"]);
+      expect(results[0]!.embedding).toEqual([0.0]);
+      expect(results[1]!.embedding).toEqual([0.2]);
+      expect(results[2]!.embedding).toEqual([0.3]);
+    });
   });
 
   describe("error handling", () => {
