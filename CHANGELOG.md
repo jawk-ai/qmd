@@ -2,6 +2,40 @@
 
 ## [Unreleased]
 
+### Changed
+
+- **Unified multi-collection search — one pass over the shared index.**
+  Searching multiple collections (or the whole index) no longer runs a serial
+  FTS + vector KNN pass *per collection per sub-query*. The collection filter is
+  now pushed into SQL as `collection IN (...)` inside `searchFTS`/`searchVec`, so
+  `structuredSearch` runs a single FTS pass and a single vector pass per query
+  signal regardless of how many collections are in scope. This collapses the old
+  `N × (FTS + vec)` cost to `1 × (FTS + vec)` — roughly O(1) in collection count
+  instead of O(N) — and fixes three correctness bugs that rode along with the
+  loop: the "first sub-query gets 2× RRF weight" boost now lands on the true first
+  query signal (not whichever collection iterated first); the RRF top-rank bonus
+  is applied once to the true global top (not once per collection); and vector KNN
+  is no longer starved by out-of-scope neighbours (fetch `k` is inflated when a
+  collection filter is present). Ranking is now genuinely global across the
+  selected scope.
+- **MCP `query` tool and REST `/query`/`/search`: omitting `collections` now
+  searches the whole index in one pass.** Previously an omitted `collections`
+  field was substituted with the full list of default collection names and then
+  fed through the per-collection loop. When every collection is included by
+  default this is identical in scope but far faster; when non-default collections
+  exist, the default set is still applied — but as a single cheap `IN (...)`
+  filter that preserves their visibility semantics, not a per-collection loop.
+- CLI `qmd query`, `qmd vsearch`, and `qmd search` push the full `-c` collection
+  set into the SQL filter instead of post-filtering results in JS after
+  rerank/slice. This fixes an under-return bug where a multi-collection search
+  could return fewer results than requested because the JS post-filter dropped
+  candidates the global pass had already selected.
+- SDK: `searchFTS`, `searchVec`, `store.searchLex`, `store.searchVector`,
+  `hybridQuery`, and `vectorSearchQuery` now accept a `string | string[]`
+  collection filter (single-collection `string` remains supported for backward
+  compatibility). Added a `collections?: string[]` option alongside the legacy
+  `collection?: string` on the relevant option types.
+
 ## [2.6.3] - 2026-06-24
 
 ### Added

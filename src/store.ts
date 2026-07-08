@@ -1308,8 +1308,8 @@ export type Store = {
   toVirtualPath: (absolutePath: string) => string | null;
 
   // Search
-  searchFTS: (query: string, limit?: number, collectionName?: string) => SearchResult[];
-  searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
+  searchFTS: (query: string, limit?: number, collections?: string | string[]) => SearchResult[];
+  searchVec: (query: string, model: string, limit?: number, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => Promise<SearchResult[]>;
 
   // Query expansion & reranking
   expandQuery: (query: string, model?: string, intent?: string) => Promise<ExpandedQuery[]>;
@@ -1990,8 +1990,8 @@ export function createStore(dbPath?: string): Store {
     toVirtualPath: (absolutePath: string) => toVirtualPath(db, absolutePath),
 
     // Search
-    searchFTS: (query: string, limit?: number, collectionName?: string) => searchFTS(db, query, limit, collectionName),
-    searchVec: (query: string, model: string, limit?: number, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collectionName, session, precomputedEmbedding),
+    searchFTS: (query: string, limit?: number, collections?: string | string[]) => searchFTS(db, query, limit, collections),
+    searchVec: (query: string, model: string, limit?: number, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]) => searchVec(db, query, model, limit, collections, session, precomputedEmbedding),
 
     // Query expansion & reranking
     expandQuery: (query: string, model?: string, intent?: string) => expandQuery(query, model ?? store.llm?.generateModelName ?? DEFAULT_QUERY_MODEL, db, intent, store.llm),
@@ -3564,21 +3564,43 @@ export function validateLexQuery(query: string): string | null {
   return null;
 }
 
-export function searchFTS(db: Database, query: string, limit: number = 20, collectionName?: string): SearchResult[] {
+/**
+ * Normalize a collection filter into a de-duplicated array of names.
+ *
+ * Accepts a single collection name, an array of names, or undefined.
+ * An empty result means "no filter" — search the whole index. This lets
+ * `searchFTS`/`searchVec` accept either the legacy single-collection `string`
+ * or the multi-collection `string[]` form without branching at every call site.
+ */
+export function normalizeCollections(collections?: string | string[]): string[] {
+  if (!collections) return [];
+  const arr = Array.isArray(collections) ? collections : [collections];
+  const seen = new Set<string>();
+  for (const c of arr) {
+    if (c) seen.add(c);
+  }
+  return Array.from(seen);
+}
+
+export function searchFTS(db: Database, query: string, limit: number = 20, collections?: string | string[]): SearchResult[] {
   const ftsQuery = buildFTS5Query(query);
   if (!ftsQuery) return [];
+
+  const collSet = normalizeCollections(collections);
+  const hasFilter = collSet.length > 0;
 
   // Use a CTE to force FTS5 to run first, then filter by collection.
   // Without the CTE, SQLite's query planner combines FTS5 MATCH with the
   // collection filter in a single WHERE clause, which can cause it to
   // abandon the FTS5 index and fall back to a full scan — turning an 8ms
-  // query into a 17-second query on large collections.
+  // query into a 17-second query on large collections. The `collection IN (...)`
+  // predicate below MUST stay outside the CTE for the same reason.
   const params: (string | number)[] = [ftsQuery];
 
   // When filtering by collection, fetch extra candidates from the FTS index
   // since some will be filtered out. Without a collection filter we can
   // fetch exactly the requested limit.
-  const ftsLimit = collectionName ? limit * 10 : limit;
+  const ftsLimit = hasFilter ? limit * 10 : limit;
 
   let sql = `
     WITH fts_matches AS (
@@ -3601,9 +3623,9 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
     WHERE d.active = 1
   `;
 
-  if (collectionName) {
-    sql += ` AND d.collection = ?`;
-    params.push(String(collectionName));
+  if (hasFilter) {
+    sql += ` AND d.collection IN (${collSet.map(() => '?').join(',')})`;
+    params.push(...collSet);
   }
 
   // bm25 lower is better; sort ascending.
@@ -3639,24 +3661,35 @@ export function searchFTS(db: Database, query: string, limit: number = 20, colle
 // Vector Search
 // =============================================================================
 
-export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collectionName?: string, session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
+export async function searchVec(db: Database, query: string, model: string, limit: number = 20, collections?: string | string[], session?: ILLMSession, precomputedEmbedding?: number[]): Promise<SearchResult[]> {
   const tableExists = db.prepare(`SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`).get();
   if (!tableExists) return [];
 
   const embedding = precomputedEmbedding ?? await getEmbedding(query, model, true, session);
   if (!embedding) return [];
 
+  const collSet = normalizeCollections(collections);
+  const hasFilter = collSet.length > 0;
+
   // IMPORTANT: We use a two-step query approach here because sqlite-vec virtual tables
   // hang indefinitely when combined with JOINs in the same query. Do NOT try to
   // "optimize" this by combining into a single query with JOINs - it will break.
   // See: https://github.com/tobi/qmd/pull/23
+
+  // The sqlite-vec KNN cannot filter by collection, so the collection predicate
+  // is applied in step 2 (post-MATCH). When a filter is present we inflate `k`
+  // so in-scope chunks aren't starved by out-of-scope neighbours that would
+  // otherwise consume the top-k slots (mirrors the FTS ×10 candidate inflation).
+  // KNN over the unified index is a brute-force scan, so a larger k is roughly
+  // constant cost — the real win is running it once instead of once per collection.
+  const knnK = hasFilter ? limit * 10 : limit * 3;
 
   // Step 1: Get vector matches from sqlite-vec (no JOINs allowed)
   const vecResults = db.prepare(`
     SELECT hash_seq, distance
     FROM vectors_vec
     WHERE embedding MATCH ? AND k = ?
-  `).all(new Float32Array(embedding), limit * 3) as { hash_seq: string; distance: number }[];
+  `).all(new Float32Array(embedding), knnK) as { hash_seq: string; distance: number }[];
 
   if (vecResults.length === 0) return [];
 
@@ -3682,9 +3715,9 @@ export async function searchVec(db: Database, query: string, model: string, limi
   `;
   const params: string[] = [...hashSeqs];
 
-  if (collectionName) {
-    docSql += ` AND d.collection = ?`;
-    params.push(collectionName);
+  if (hasFilter) {
+    docSql += ` AND d.collection IN (${collSet.map(() => '?').join(',')})`;
+    params.push(...collSet);
   }
 
   const docRows = withLazyContentVectorMigration(db, () => db.prepare(docSql).all(...params) as {
@@ -4670,7 +4703,8 @@ export interface SearchHooks {
 }
 
 export interface HybridQueryOptions {
-  collection?: string;
+  collection?: string;       // single-collection filter (legacy; prefer `collections`)
+  collections?: string[];    // multi-collection filter (pushed into SQL `IN (...)`)
   limit?: number;           // default 10
   minScore?: number;        // default 0
   candidateLimit?: number;  // default RERANK_CANDIDATE_LIMIT
@@ -4736,7 +4770,11 @@ export async function hybridQuery(
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0;
   const candidateLimit = options?.candidateLimit ?? RERANK_CANDIDATE_LIMIT;
-  const collection = options?.collection;
+  // Prefer the multi-collection `collections` filter; fall back to the legacy
+  // single-collection `collection`. Both are pushed into SQL as `collection IN (...)`.
+  const collFilter = options?.collections && options.collections.length > 0
+    ? options.collections
+    : options?.collection;
   const explain = options?.explain ?? false;
   const intent = options?.intent;
   const skipRerank = options?.skipRerank ?? false;
@@ -4754,7 +4792,7 @@ export async function hybridQuery(
   // match may not be what the caller wants (e.g. "performance" with intent
   // "web page load times" should NOT shortcut to a sports-performance doc).
   // Pass collection directly into FTS query (filter at SQL level, not post-hoc)
-  const initialFts = store.searchFTS(query, 20, collection);
+  const initialFts = store.searchFTS(query, 20, collFilter);
   const topScore = initialFts[0]?.score ?? 0;
   const secondScore = initialFts[1]?.score ?? 0;
   const hasStrongSignal = !intent && initialFts.length > 0
@@ -4791,7 +4829,7 @@ export async function hybridQuery(
   // 3a: Run FTS for all lex expansions right away (no LLM needed)
   for (const q of expanded) {
     if (q.type === 'lex') {
-      const ftsResults = store.searchFTS(q.query, 20, collection);
+      const ftsResults = store.searchFTS(q.query, 20, collFilter);
       if (ftsResults.length > 0) {
         for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
         rankedLists.push(ftsResults.map(r => ({
@@ -4829,7 +4867,7 @@ export async function hybridQuery(
       if (!embedding) continue;
 
       const vecResults = await store.searchVec(
-        vecQueries[i]!.text, embedModel, 20, collection,
+        vecQueries[i]!.text, embedModel, 20, collFilter,
         undefined, embedding
       );
       if (vecResults.length > 0) {
@@ -5012,7 +5050,8 @@ export async function hybridQuery(
 }
 
 export interface VectorSearchOptions {
-  collection?: string;
+  collection?: string;       // single-collection filter (legacy; prefer `collections`)
+  collections?: string[];    // multi-collection filter (pushed into SQL `IN (...)`)
   limit?: number;           // default 10
   minScore?: number;        // default 0.3
   intent?: string;          // domain intent hint for disambiguation
@@ -5045,7 +5084,9 @@ export async function vectorSearchQuery(
 ): Promise<VectorSearchResult[]> {
   const limit = options?.limit ?? 10;
   const minScore = options?.minScore ?? 0.3;
-  const collection = options?.collection;
+  const collFilter = options?.collections && options.collections.length > 0
+    ? options.collections
+    : options?.collection;
   const intent = options?.intent;
 
   const hasVectors = !!store.db.prepare(
@@ -5064,7 +5105,7 @@ export async function vectorSearchQuery(
   const queryTexts = [query, ...vecExpanded.map(q => q.query)];
   const allResults = new Map<string, VectorSearchResult>();
   for (const q of queryTexts) {
-    const vecResults = await store.searchVec(q, embedModel, limit, collection);
+    const vecResults = await store.searchVec(q, embedModel, limit, collFilter);
     for (const r of vecResults) {
       const existing = allResults.get(r.filepath);
       if (!existing || r.score > existing.score) {
@@ -5170,26 +5211,29 @@ export async function structuredSearch(
     `SELECT name FROM sqlite_master WHERE type='table' AND name='vectors_vec'`
   ).get();
 
-  // Helper to run search across collections (or all if undefined)
-  const collectionList = collections ?? [undefined]; // undefined = all collections
+  // Collection filter is pushed into SQL (collection IN (...)) rather than
+  // driving a per-collection loop. A single filtered FTS/vec pass per query
+  // signal keeps RRF semantics global: `rankedLists` has exactly one entry per
+  // sub-query, so the first-list 2× weight lands on the true first signal and
+  // the RRF top-rank bonus applies once to the true global top — instead of
+  // once per collection. `undefined`/`[]` = whole index.
+  const collFilter = collections && collections.length > 0 ? collections : undefined;
 
   // Step 1: Run FTS for all lex searches (sync, instant)
   for (const search of searches) {
     if (search.type === 'lex') {
-      for (const coll of collectionList) {
-        const ftsResults = store.searchFTS(search.query, 20, coll);
-        if (ftsResults.length > 0) {
-          for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
-          rankedLists.push(ftsResults.map(r => ({
-            file: r.filepath, displayPath: r.displayPath,
-            title: r.title, body: r.body || "", score: r.score,
-          })));
-          rankedListMeta.push({
-            source: "fts",
-            queryType: "lex",
-            query: search.query,
-          });
-        }
+      const ftsResults = store.searchFTS(search.query, 20, collFilter);
+      if (ftsResults.length > 0) {
+        for (const r of ftsResults) docidMap.set(r.filepath, r.docid);
+        rankedLists.push(ftsResults.map(r => ({
+          file: r.filepath, displayPath: r.displayPath,
+          title: r.title, body: r.body || "", score: r.score,
+        })));
+        rankedListMeta.push({
+          source: "fts",
+          queryType: "lex",
+          query: search.query,
+        });
       }
     }
   }
@@ -5213,23 +5257,21 @@ export async function structuredSearch(
         const embedding = embeddings[i]?.embedding;
         if (!embedding) continue;
 
-        for (const coll of collectionList) {
-          const vecResults = await store.searchVec(
-            vecSearches[i]!.query, embedModel, 20, coll,
-            undefined, embedding
-          );
-          if (vecResults.length > 0) {
-            for (const r of vecResults) docidMap.set(r.filepath, r.docid);
-            rankedLists.push(vecResults.map(r => ({
-              file: r.filepath, displayPath: r.displayPath,
-              title: r.title, body: r.body || "", score: r.score,
-            })));
-            rankedListMeta.push({
-              source: "vec",
-              queryType: vecSearches[i]!.type,
-              query: vecSearches[i]!.query,
-            });
-          }
+        const vecResults = await store.searchVec(
+          vecSearches[i]!.query, embedModel, 20, collFilter,
+          undefined, embedding
+        );
+        if (vecResults.length > 0) {
+          for (const r of vecResults) docidMap.set(r.filepath, r.docid);
+          rankedLists.push(vecResults.map(r => ({
+            file: r.filepath, displayPath: r.displayPath,
+            title: r.title, body: r.body || "", score: r.score,
+          })));
+          rankedListMeta.push({
+            source: "vec",
+            queryType: vecSearches[i]!.type,
+            query: vecSearches[i]!.query,
+          });
         }
       }
     }

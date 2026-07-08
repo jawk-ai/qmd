@@ -174,8 +174,21 @@ async function createMcpServer(store: QMDStore): Promise<McpServer> {
     { instructions: await buildInstructions(store) },
   );
 
-  // Pre-fetch default collection names for search tools
+  // Pre-fetch default collection names for search tools.
+  //
+  // When a client omits `collections`, we want the fast whole-index pass
+  // (collection filter = undefined) rather than substituting every default
+  // collection name into an N-way filter. But if the index has non-default
+  // collections, "omitted" must still hide them — so in that case we pass the
+  // default set as a single cheap `collection IN (...)` filter instead of a
+  // per-collection loop. `omittedCollectionsFilter` encapsulates that gate.
   const defaultCollectionNames = await store.getDefaultCollectionNames();
+  const allCollectionCount = (await store.listCollections()).length;
+  const hasNonDefaultCollections = defaultCollectionNames.length < allCollectionCount;
+  // Filter to apply when the caller provides no `collections`:
+  //  - all collections are default → undefined (search the whole index, fastest)
+  //  - some are non-default → the default set as an IN filter (preserve visibility)
+  const omittedCollectionsFilter = hasNonDefaultCollections ? defaultCollectionNames : undefined;
 
   // ---------------------------------------------------------------------------
   // Resource: qmd://{path} - read-only access to documents by path
@@ -340,8 +353,12 @@ Intent-aware lex (C++ performance, not sports):
         };
       }
 
-      // Use default collections if none specified
-      const effectiveCollections = collections ?? defaultCollectionNames;
+      // Omitted `collections` ⇒ whole-index one-pass search (or default-set IN
+      // filter when non-default collections exist). An explicit list is passed
+      // straight through so retrieval filters in SQL, not via a per-collection loop.
+      const effectiveCollections = collections && collections.length > 0
+        ? collections
+        : omittedCollectionsFilter;
 
       // Plain `query` is auto-expanded by the SDK (expand → fuse → rerank);
       // `searches` runs the caller's typed sub-queries directly.
@@ -351,7 +368,7 @@ Intent-aware lex (C++ performance, not sports):
 
       const results = await store.search({
         ...searchOptions,
-        collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+        collections: effectiveCollections && effectiveCollections.length > 0 ? effectiveCollections : undefined,
         limit,
         minScore,
         candidateLimit,
@@ -628,8 +645,13 @@ export async function startMcpHttpServer(
     ...(existsSync(configPath) ? { configPath } : {}),
   });
 
-  // Pre-fetch default collection names for REST endpoint
+  // Pre-fetch default collection names for REST endpoint.
+  // Same gate as the MCP tool: omitted `collections` ⇒ whole-index (undefined)
+  // when all collections are default, else the default set as an IN filter.
   const defaultCollectionNames = await store.getDefaultCollectionNames();
+  const allCollectionCount = (await store.listCollections()).length;
+  const hasNonDefaultCollections = defaultCollectionNames.length < allCollectionCount;
+  const omittedCollectionsFilter = hasNonDefaultCollections ? defaultCollectionNames : undefined;
 
   // Session map: each client gets its own McpServer + Transport pair (MCP spec requirement).
   // The store is shared — it's stateless SQLite, safe for concurrent access.
@@ -738,12 +760,16 @@ export async function startMcpHttpServer(
           query: String(s.query || ""),
         }));
 
-        // Use default collections if none specified
-        const effectiveCollections = Array.isArray(params.collections) ? params.collections.map(String) : defaultCollectionNames;
+        // Explicit `collections` array ⇒ pass through; omitted ⇒ whole-index
+        // one-pass (or default-set IN filter when non-default collections exist).
+        const explicitCollections = Array.isArray(params.collections) ? params.collections.map(String) : undefined;
+        const effectiveCollections = explicitCollections && explicitCollections.length > 0
+          ? explicitCollections
+          : omittedCollectionsFilter;
 
         const results = await store.search({
           queries,
-          collections: effectiveCollections.length > 0 ? effectiveCollections : undefined,
+          collections: effectiveCollections && effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: typeof params.limit === "number" ? params.limit : 10,
           minScore: typeof params.minScore === "number" ? params.minScore : 0,
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,

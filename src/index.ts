@@ -177,7 +177,10 @@ export interface SearchOptions {
  */
 export interface LexSearchOptions {
   limit?: number;
+  /** Single-collection filter (legacy; prefer `collections`). */
   collection?: string;
+  /** Multi-collection filter — pushed into SQL as `collection IN (...)`. */
+  collections?: string[];
 }
 
 /**
@@ -185,7 +188,10 @@ export interface LexSearchOptions {
  */
 export interface VectorSearchOptions {
   limit?: number;
+  /** Single-collection filter (legacy; prefer `collections`). */
   collection?: string;
+  /** Multi-collection filter — pushed into SQL as `collection IN (...)`. */
+  collections?: string[];
 }
 
 /**
@@ -425,8 +431,8 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
         chunkStrategy: opts.chunkStrategy,
       });
     },
-    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collection),
+    searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collections ?? opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collections ?? opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
