@@ -1,8 +1,8 @@
-# AGENTS.md — heintonny/qmd fork
+# AGENTS.md — jawk-ai/qmd (maintained fork)
 
 Fork of [tobi/qmd](https://github.com/tobi/qmd) with remote OpenAI-compatible
-embed (Gemini 3072d) and unified multi-collection search. See `README.md` for
-upstream CLI/docs; this file is the short agent brief for fork-specific work.
+embed (Gemini 3072d on qmd-hub prod) and unified multi-collection search.
+See `README.md` for upstream CLI/docs; `docs/FORK.md` for fork policy and deltas.
 
 ## Fork deltas (vs upstream main)
 
@@ -12,14 +12,16 @@ upstream CLI/docs; this file is the short agent brief for fork-specific work.
 
 ## Remotes
 
-- `origin` — `heintonny/qmd` (fork main)
+- `origin` — `jawk-ai/qmd` (canonical fork)
 - `upstream` — `tobi/qmd`
 
 ## Deploy context
 
-Prod worker on srv1490285 pins this fork via `qmd-hub` Dockerfile `QMD_GIT_REF`.
-Coordinate deploy with `heintonny/agent-system-admin` incidents/runbooks — do not
-change `/opt/qmd-hub` from this repo alone.
+Prod qmd-hub worker on srv1490285 builds this fork via `qmd-hub`
+`deploy/Dockerfile.worker` (`QMD_GIT_URL`, `QMD_GIT_REF`). System-wide
+`/usr/bin/qmd` on srv also tracks this repo. Coordinate deploy with
+`heintonny/agent-system-admin` incidents/runbooks — do not change `/opt/qmd-hub`
+from this repo alone.
 
 ## Pre-ship review
 

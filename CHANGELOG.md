@@ -2,6 +2,14 @@
 
 ## [Unreleased]
 
+## [2.6.3-jawk.1] - 2026-07-09
+
+### Changed
+
+- **Repository home:** transferred from `heintonny/qmd` to `jawk-ai/qmd` (canonical
+  maintained fork for qmd-hub and srv1490285). Added `docs/FORK.md` documenting upstream
+  relationship and version tag policy.
+
 ### Added
 
 - Remote embedding, reranking, and query expansion via OpenAI-compatible API
@@ -11,7 +19,10 @@
   tokenization are preserved via a hybrid routing layer. Includes circuit
   breakers, dimension validation, and batch splitting.
 
-### Changed
+### Fixed
+
+- Remote embed batch: accept responses without per-item `index` (Gemini/OpenAI
+  positional order) while still validating explicit indices when present.
 
 - **Unified multi-collection search — one pass over the shared index.**
   Searching multiple collections (or the whole index) no longer runs a serial

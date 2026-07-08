@@ -1,5 +1,9 @@
 # QMD - Query Markup Documents
 
+> **Maintained fork.** Canonical home: [jawk-ai/qmd](https://github.com/jawk-ai/qmd)
+> (JAWK-maintained fork of [tobi/qmd](https://github.com/tobi/qmd)). The qmd-hub
+> reference instance does **not** run vanilla upstream. See [docs/FORK.md](docs/FORK.md).
+
 An on-device search engine for everything you need to remember. Index your markdown notes, meeting transcripts, documentation, and knowledge bases. Search with keywords or natural language. Ideal for your agentic flows.
 
 QMD combines BM25 full-text search, vector semantic search, and LLM re-ranking—all running locally via node-llama-cpp with GGUF models.

@@ -1,4 +1,4 @@
-# Bugbot — heintonny/qmd fork (lokal /review-bugbot)
+# Bugbot — jawk-ai/qmd fork (lokal /review-bugbot)
 
 GitHub Bugbot er av. Delte sikkerhetsregler:
 `heintonny/agent-system-admin/.cursor/BUGBOT.md`.
