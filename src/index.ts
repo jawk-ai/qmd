@@ -68,6 +68,8 @@ import {
 import {
   LlamaCpp,
 } from "./llm.js";
+import { remoteConfigFromEnv, RemoteLLM } from "./remote-llm.js";
+import { HybridLLM } from "./hybrid-llm.js";
 import {
   setConfigSource,
   loadConfig,
@@ -380,14 +382,24 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
   // Create a per-store LlamaCpp instance — lazy-loads models on first use,
   // auto-unloads after 5 min inactivity to free VRAM.
-  const llm = new LlamaCpp({
+  const localLlm = new LlamaCpp({
     embedModel: config?.models?.embed,
     generateModel: config?.models?.generate,
     rerankModel: config?.models?.rerank,
     inactivityTimeoutMs: 5 * 60 * 1000,
     disposeModelsOnInactivity: true,
   });
-  internal.llm = llm;
+
+  // If remote embedding is configured (QMD_EMBED_API_* env or YAML models),
+  // pair it with the local backend via HybridLLM so BOTH indexing and
+  // query-time embedding use the remote model. Without this the store's LLM
+  // is local-only and query embeddings mismatch a remote-embedded index
+  // (e.g. local 768-dim query vs Gemini 3072-dim index).
+  const remoteConfig = remoteConfigFromEnv(config?.models);
+  const activeLlm = remoteConfig
+    ? new HybridLLM(new RemoteLLM(remoteConfig), localLlm)
+    : localLlm;
+  internal.llm = activeLlm;
 
   const store: QMDStore = {
     internal,
@@ -432,7 +444,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
       });
     },
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collections ?? opts?.collection),
-    searchVector: async (q, opts) => internal.searchVec(q, llm.embedModelName, opts?.limit, opts?.collections ?? opts?.collection),
+    searchVector: async (q, opts) => internal.searchVec(q, activeLlm.embedModelName, opts?.limit, opts?.collections ?? opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
@@ -545,7 +557,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
 
     // Lifecycle
     close: async () => {
-      await llm.dispose();
+      await localLlm.dispose();
       internal.close();
       if (hasYamlConfig || options.config) {
         setConfigSource(undefined); // Reset config source

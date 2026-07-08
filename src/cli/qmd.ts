@@ -80,7 +80,9 @@ import {
   type ReindexResult,
   type ChunkStrategy,
 } from "../store.js";
-import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, setDefaultLlamaCpp, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { disposeDefaultLlamaCpp, getDefaultLlamaCpp, getDefaultLLM, setDefaultLLM, LlamaCpp, withLLMSession, pullModels, DEFAULT_MODEL_CACHE_DIR, DEFAULT_EMBED_MODEL_URI, DEFAULT_GENERATE_MODEL_URI, DEFAULT_RERANK_MODEL_URI, resolveEmbedModel, resolveGenerateModel, resolveRerankModel, resolveModels, inspectGgufFile, isDarwinMetalMitigationActive } from "../llm.js";
+import { RemoteLLM, remoteConfigFromEnv } from "../remote-llm.js";
+import { HybridLLM } from "../hybrid-llm.js";
 import {
   formatSearchResults,
   formatDocuments,
@@ -133,11 +135,21 @@ function getStore(): ReturnType<typeof createStore> {
       const activeModels = ensureModelsConfiguredForCli();
       const config = loadConfig();
       syncConfigToDb(store.db, config);
-      setDefaultLlamaCpp(new LlamaCpp({
+      // Local backend uses the CLI-resolved model set (config.models > env > defaults).
+      const localLlm = new LlamaCpp({
         embedModel: activeModels.embed,
         generateModel: activeModels.generate,
         rerankModel: activeModels.rerank,
-      }));
+      });
+      // Layer remote OpenAI-compatible embedding on top when configured
+      // (QMD_EMBED_API_* env vars take precedence over YAML models config).
+      const remoteConfig = remoteConfigFromEnv(config.models);
+      if (remoteConfig) {
+        const remoteLlm = new RemoteLLM(remoteConfig);
+        setDefaultLLM(new HybridLLM(remoteLlm, localLlm));
+      } else {
+        setDefaultLLM(localLlm);
+      }
     } catch {
       // Config may not exist yet — that's fine, DB works without it
     }
@@ -616,7 +628,6 @@ async function showStatus(): Promise<void> {
     console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
-
 
   // Tips section
   const tips: string[] = [];
@@ -1863,10 +1874,13 @@ function resolveModelsForCli(): { embed: string; generate: string; rerank: strin
 async function vectorIndex(
   model: string = resolveEmbedModelForCli(),
   force: boolean = false,
-  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; maxDurationMs?: number },
+  batchOptions?: { maxDocsPerBatch?: number; maxBatchBytes?: number; chunkStrategy?: ChunkStrategy; collection?: string; sessionMaxMs?: number },
 ): Promise<void> {
   const storeInstance = getStore();
   const db = storeInstance.db;
+
+  // Use the actual model name from the configured LLM (may be remote, not the default GGUF URI)
+  model = getDefaultLLM().embedModelName;
 
   if (force) {
     console.log(`${c.yellow}Force re-indexing: clearing all vectors...${c.reset}`);
@@ -1898,7 +1912,7 @@ async function vectorIndex(
     maxDocsPerBatch: batchOptions?.maxDocsPerBatch,
     maxBatchBytes: batchOptions?.maxBatchBytes,
     chunkStrategy: batchOptions?.chunkStrategy,
-    maxDurationMs: batchOptions?.maxDurationMs,
+    sessionMaxMs: batchOptions?.sessionMaxMs,
     onProgress: (info) => {
       if (info.totalBytes === 0) return;
       // Progress is measured by input bytes, not by chunks. The final chunk
@@ -2723,6 +2737,7 @@ function parseCLI() {
       "max-docs-per-batch": { type: "string" },
       "max-batch-mb": { type: "string" },
       timeout: { type: "string" },  // embed session cap in minutes (0 = no limit; default 30)
+      "session-max-ms": { type: "string" },  // Override 30min embed session timeout (raw ms)
       // Update options
       pull: { type: "boolean" },  // git pull before update
       refresh: { type: "boolean" },
@@ -3262,6 +3277,8 @@ function showHelp(): void {
   console.log("    --max-docs-per-batch <n>    - Cap docs loaded into memory per embedding batch");
   console.log("    --max-batch-mb <n>          - Cap UTF-8 MB loaded into memory per embedding batch");
   console.log("    --timeout <minutes>         - Embed session cap in minutes (0 = no limit; default 30)");
+  console.log("    --session-max-ms <ms>       - Override embed session timeout in raw ms (default 30 min, 0 = no timeout).");
+  console.log("                                  Env: QMD_EMBED_SESSION_MAX_MS. CLI flag takes precedence.");
   console.log("  qmd cleanup                   - Clear caches, vacuum DB");
   console.log("");
   console.log("Query syntax (qmd query):");
@@ -3734,7 +3751,7 @@ async function runDoctorDeviceChecks(nextSteps: string[]): Promise<void> {
   }
 
   try {
-    const device = await getDefaultLlamaCpp().getDeviceInfo({ allowBuild: false });
+    const device = await (getDefaultLlamaCpp() as LlamaCpp).getDeviceInfo({ allowBuild: false });
     if (process.stdout.isTTY) {
       process.stdout.write(`\r${" ".repeat(crashHint.length)}\r`);
     }
@@ -4273,7 +4290,20 @@ if (isMain) {
         const maxDocsPerBatch = parseEmbedBatchOption("maxDocsPerBatch", cli.values["max-docs-per-batch"]);
         const maxBatchMb = parseEmbedBatchOption("maxBatchBytes", cli.values["max-batch-mb"]);
         const embedChunkStrategy = parseChunkStrategy(cli.values["chunk-strategy"]);
-        const embedMaxDurationMs = parseEmbedTimeoutOption(cli.values["timeout"]);
+        // --timeout is expressed in minutes (v2.6.3); --session-max-ms is a raw
+        // millisecond override. Both map to the embed session cap; --timeout wins
+        // when both are supplied.
+        let sessionMaxMs = parseEmbedTimeoutOption(cli.values["timeout"]);
+        if (sessionMaxMs === undefined) {
+          const sessionMaxRaw = cli.values["session-max-ms"];
+          if (typeof sessionMaxRaw === "string") {
+            const parsed = parseInt(sessionMaxRaw, 10);
+            if (!Number.isFinite(parsed) || parsed < 0) {
+              throw new Error(`--session-max-ms must be a non-negative integer (got "${sessionMaxRaw}"); use 0 to disable timeout`);
+            }
+            sessionMaxMs = parsed;
+          }
+        }
         // Validate -c against configured collections before dispatching, so a
         // typo errors with "Collection not found: X" instead of silently
         // reporting success because no pending docs match a nonexistent name.
@@ -4285,7 +4315,7 @@ if (isMain) {
           maxBatchBytes: maxBatchMb === undefined ? undefined : maxBatchMb * 1024 * 1024,
           chunkStrategy: embedChunkStrategy,
           collection: embedCollection,
-          maxDurationMs: embedMaxDurationMs,
+          sessionMaxMs,
         });
       } catch (error) {
         exitWithError(error);
