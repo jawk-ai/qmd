@@ -1234,13 +1234,15 @@ QMD can offload embedding and reranking to a remote OpenAI-compatible server (vL
 | `QMD_EMBED_API_MODEL` | Yes | Model name, e.g. `BAAI/bge-m3` |
 | `QMD_EMBED_API_KEY` | No | Bearer token for auth |
 | `QMD_RERANK_API_URL` | No | Rerank endpoint (defaults to embed URL) |
-| `QMD_RERANK_API_MODEL` | No | Rerank model name |
+| `QMD_RERANK_API_MODEL` | No | Rerank model name. **If unset, reranking falls back to the local llama.cpp reranker** (see note below) rather than being skipped. |
 | `QMD_RERANK_API_KEY` | No | Rerank auth (defaults to embed key) |
 | `QMD_EMBED_CONCURRENCY` | No | Concurrent embedding requests during `qmd embed` (default `1` = sequential). Raise (e.g. `4`–`8`) to saturate high-rate-limit APIs like Gemini. |
 | `QMD_REMOTE_BATCH_SIZE` | No | Texts per embedding HTTP request (default `32`). Also controls the chunk batch size in `qmd embed`, so larger values (e.g. `100`–`250`) mean fewer, bigger requests. |
 | `QMD_EMBED_MAX_RETRIES` | No | Retries for HTTP 429/5xx embed responses with exponential backoff + jitter, honoring `Retry-After` (default `3`, `0` disables) |
 
 **Throughput tuning:** with a remote backend, `qmd embed` sends one HTTP request per `QMD_REMOTE_BATCH_SIZE` chunks and keeps up to `QMD_EMBED_CONCURRENCY` requests in flight. For example `QMD_EMBED_CONCURRENCY=6 QMD_REMOTE_BATCH_SIZE=100` gives up to 600 chunks in flight. Defaults (`1`/`32`) preserve the fully sequential behavior.
+
+**Rerank backend:** embedding and reranking are configured independently. When remote embedding is enabled but `QMD_RERANK_API_MODEL` is *not* set, reranking runs on the **local llama.cpp reranker** — it is not skipped. Remote reranking is used only when `QMD_RERANK_API_MODEL` is configured. In all cases, if reranking fails (missing local GGUF, native init failure, or a remote 5xx/circuit-breaker), the query degrades gracefully to RRF-only ordering instead of erroring. `qmd status` and `qmd doctor` report the effective rerank backend, and `HybridLLM` emits structured `qmd.rerank {…}` diagnostics to stderr (backend, candidate count, duration).
 
 **YAML config** (`~/.config/qmd/index.yml`):
 ```yaml

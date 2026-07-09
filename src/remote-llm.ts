@@ -144,6 +144,16 @@ export class RemoteLLM implements LLM {
     return !!this.config.expandApiModel;
   }
 
+  /** The remote rerank model id, when a rerank endpoint is configured. */
+  get rerankModelName(): string | undefined {
+    return this.config.rerankApiModel;
+  }
+
+  /** True when rerankApiModel is configured and remote reranking is available. */
+  get supportsRerank(): boolean {
+    return !!this.config.rerankApiModel;
+  }
+
   // ---------------------------------------------------------------------------
   // Embedding
   // ---------------------------------------------------------------------------

@@ -27,6 +27,7 @@ import {
   DEFAULT_EMBED_MODEL_URI,
   DEFAULT_RERANK_MODEL_URI,
   DEFAULT_GENERATE_MODEL_URI,
+  RerankUnavailableError,
   type LLM,
   type RerankDocument,
   type ILLMSession,
@@ -3882,7 +3883,10 @@ async function rerankOrFallback(
     return await store.rerank(query, chunks, undefined, intent);
   } catch (err) {
     const msg = err instanceof Error ? err.message : String(err);
-    if (/rerank/i.test(msg)) {
+    // RerankUnavailableError is the explicit "rerank could not run" signal from
+    // HybridLLM; the /rerank/i check also catches raw errors from the
+    // local-only LlamaCpp path (e.g. "Failed to create any rerank context").
+    if (err instanceof RerankUnavailableError || /rerank/i.test(msg)) {
       // Synthesize reranker scores from candidate order (already RRF-sorted),
       // so downstream blending preserves the retrieval ranking.
       return chunks.map((c, i) => ({ file: c.file, score: 1 / (i + 1) }));
