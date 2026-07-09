@@ -628,7 +628,7 @@ async function showStatus(): Promise<void> {
     const activeModels = resolveModelsForCli();
     console.log(`\n${c.bold}Models${c.reset}`);
     console.log(`  Embedding:   ${hfLink(activeModels.embed)}`);
-    console.log(`  Reranking:   ${hfLink(activeModels.rerank)}`);
+    console.log(`  Reranking:   ${describeRerankBackend(activeModels.rerank, hfLink)}`);
     console.log(`  Generation:  ${hfLink(activeModels.generate)}`);
   }
 
@@ -1889,6 +1889,24 @@ export function resolveRerankModelForCli(): string {
 
 function resolveModelsForCli(): { embed: string; generate: string; rerank: string } {
   return ensureModelsConfiguredForCli();
+}
+
+/**
+ * Describe the EFFECTIVE rerank backend for `qmd status`/`qmd doctor`.
+ *
+ * With a remote embed backend but no remote rerank endpoint (the common
+ * remote-Gemini-embed case), reranking runs on the LOCAL llama.cpp model — the
+ * configured local GGUF, not a remote id. Report that truthfully instead of
+ * implying rerank always goes to the remote service. Requires getStore() to
+ * have configured the default LLM first (callers here always have).
+ */
+function describeRerankBackend(localRerankModel: string, hfLink: (uri: string) => string): string {
+  const llm = getDefaultLLM();
+  if (llm instanceof HybridLLM && llm.rerankBackend === "remote") {
+    const remoteModel = llm.rerankModelName ?? "remote";
+    return `${remoteModel} ${c.dim}(remote endpoint)${c.reset}`;
+  }
+  return `${hfLink(localRerankModel)} ${c.dim}(local llama.cpp)${c.reset}`;
 }
 
 async function vectorIndex(
@@ -3584,6 +3602,27 @@ function checkModelDefaults(activeModels: { embed: string; generate: string; rer
   doctorCheck("model defaults", false, `non-default model configuration: ${notes.join("; ")}`);
 }
 
+/**
+ * Report the EFFECTIVE rerank backend so operators can see, at a glance,
+ * whether reranking runs remotely or on the local llama.cpp model. A common
+ * misconfiguration is a remote embed backend (QMD_EMBED_API_*) with no remote
+ * rerank endpoint (QMD_RERANK_API_MODEL): reranking then silently falls back to
+ * the local reranker, which must be present and downloaded.
+ */
+function checkRerankBackend(activeModels: { embed: string; generate: string; rerank: string }): void {
+  const llm = getDefaultLLM();
+  if (llm instanceof HybridLLM && llm.rerankBackend === "remote") {
+    doctorCheck("rerank backend", true, `remote endpoint (model ${llm.rerankModelName ?? "unknown"})`);
+    return;
+  }
+
+  const remoteEmbedConfigured = !!(process.env.QMD_EMBED_API_URL && process.env.QMD_EMBED_API_MODEL);
+  const detail = remoteEmbedConfigured
+    ? `local llama.cpp (${activeModels.rerank}) — remote embed is configured but QMD_RERANK_API_MODEL is not, so reranking runs locally`
+    : `local llama.cpp (${activeModels.rerank})`;
+  doctorCheck("rerank backend", true, detail);
+}
+
 function checkModelCache(activeModels: { embed: string; generate: string; rerank: string }, nextSteps: string[]): void {
   const models = [
     ["embedding", activeModels.embed],
@@ -3883,6 +3922,7 @@ async function showDoctor(): Promise<void> {
   const configModels = configCheck.config?.models ?? {};
   checkEnvironmentOverrides(activeModels, configModels);
   checkModelDefaults(activeModels, configModels);
+  checkRerankBackend(activeModels);
   checkModelCache(activeModels, nextSteps);
 
   await runDoctorDeviceChecks(nextSteps);

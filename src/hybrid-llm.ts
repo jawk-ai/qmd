@@ -20,6 +20,7 @@ import type {
   RerankOptions,
   RerankResult,
 } from "./llm.js";
+import { RerankUnavailableError } from "./llm.js";
 import { RemoteLLM } from "./remote-llm.js";
 
 export class HybridLLM implements LLM {
@@ -49,8 +50,32 @@ export class HybridLLM implements LLM {
     return this.local.generateModelName;
   }
 
+  // Report the EFFECTIVE rerank model, matching the backend rerank() will use:
+  // the remote model when a remote rerank endpoint is configured, otherwise the
+  // local llama.cpp reranker's model. This keeps `qmd status`/`qmd doctor`
+  // truthful (a remote-embed-only deployment reranks locally, not remotely).
   get rerankModelName(): string | undefined {
-    return this.remote.rerankModelName;
+    return this.rerankBackend === "remote"
+      ? this.remote.rerankModelName
+      : this.local.rerankModelName;
+  }
+
+  /**
+   * The rerank backend queries will actually use:
+   *   "remote" — the remote backend exposes a configured rerank endpoint.
+   *   "local"  — no remote rerank endpoint; fall back to the local llama.cpp
+   *              reranker.
+   * Exposed so diagnostics (`qmd status`/`qmd doctor`) can report the effective
+   * backend truthfully rather than assuming rerank always goes remote.
+   */
+  get rerankBackend(): "remote" | "local" {
+    return this.remoteSupportsRerank ? "remote" : "local";
+  }
+
+  private get remoteSupportsRerank(): boolean {
+    const remote = this.remote as { supportsRerank?: boolean; rerankModelName?: string };
+    if (typeof remote.supportsRerank === "boolean") return remote.supportsRerank;
+    return !!remote.rerankModelName;
   }
 
   // Route to remote
@@ -62,8 +87,60 @@ export class HybridLLM implements LLM {
     return this.remote.embedBatch(texts, options);
   }
 
-  rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
-    return this.remote.rerank(query, documents, options);
+  /**
+   * Rerank candidates for `query`.
+   *
+   * Routing:
+   *   - Remote rerank endpoint configured → route to the remote backend
+   *     (GPU-heavy, benefits from offloading).
+   *   - Otherwise → fall back to the LOCAL llama.cpp reranker. Previously the
+   *     composite routed rerank unconditionally to the remote backend, so a
+   *     deployment with remote embed but NO remote rerank endpoint (the common
+   *     remote-Gemini-embed case) silently skipped reranking entirely and
+   *     returned RRF-only results.
+   *
+   * Failure handling: any backend error is wrapped in a RerankUnavailableError
+   * so the search pipeline degrades to RRF-only ordering (see rerankOrFallback)
+   * instead of crashing the query. Reranking is a quality refinement, not a
+   * hard dependency — a missing GGUF or a failed native init must never fail a
+   * search.
+   */
+  async rerank(query: string, documents: RerankDocument[], options?: RerankOptions): Promise<RerankResult> {
+    const backend = this.rerankBackend;
+    const candidateCount = documents.length;
+
+    // Nothing to score — avoid loading a model (and emitting logs) for 0 docs.
+    if (candidateCount === 0) {
+      return { results: [], model: this.rerankModelName ?? "" };
+    }
+
+    const target = backend === "remote" ? this.remote : this.local;
+    const startedAt = Date.now();
+    logRerankEvent({ event: "start", backend, candidates: candidateCount });
+
+    try {
+      const result = await target.rerank(query, documents, options);
+      logRerankEvent({
+        event: "done",
+        backend,
+        candidates: candidateCount,
+        durationMs: Date.now() - startedAt,
+        model: result.model,
+      });
+      return result;
+    } catch (err) {
+      const reason = err instanceof Error ? err.message : String(err);
+      logRerankEvent({
+        event: "fallback",
+        backend,
+        candidates: candidateCount,
+        durationMs: Date.now() - startedAt,
+        reason,
+      });
+      // Tag the failure so the pipeline reliably degrades to RRF-only ordering
+      // rather than surfacing a raw (possibly non-"rerank") error to the query.
+      throw new RerankUnavailableError(`${backend} rerank failed: ${reason}`, backend, err);
+    }
   }
 
   // Route to local
@@ -99,4 +176,33 @@ export class HybridLLM implements LLM {
   async dispose(): Promise<void> {
     await Promise.all([this.remote.dispose(), this.local.dispose()]);
   }
+}
+
+// =============================================================================
+// Rerank observability
+// =============================================================================
+
+type RerankLogEvent = {
+  /** Lifecycle phase: rerank started, completed, or fell back to RRF. */
+  event: "start" | "done" | "fallback";
+  /** Which backend was used. */
+  backend: "remote" | "local";
+  /** Number of candidate documents passed to the reranker. */
+  candidates: number;
+  /** Wall-clock duration in ms (done/fallback only). */
+  durationMs?: number;
+  /** Effective rerank model (done only). */
+  model?: string;
+  /** Failure reason (fallback only). */
+  reason?: string;
+};
+
+/**
+ * Emit one structured, machine-parseable observability line per rerank phase to
+ * stderr. stdout is reserved for JSON payloads (see llm.ts), so diagnostics go
+ * to stderr — matching the existing `QMD Warning:` convention. The stable
+ * `qmd.rerank` prefix keeps these greppable in worker/daemon logs.
+ */
+function logRerankEvent(fields: RerankLogEvent): void {
+  process.stderr.write(`qmd.rerank ${JSON.stringify(fields)}\n`);
 }

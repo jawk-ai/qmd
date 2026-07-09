@@ -178,6 +178,24 @@ export type RerankResult = {
 };
 
 /**
+ * Thrown when reranking cannot be performed by the selected backend — e.g. a
+ * remote rerank endpoint is unavailable/erroring, or the local llama.cpp
+ * reranker model is missing or fails to initialize. Reranking is a quality
+ * refinement, never a hard dependency of search: callers should catch this and
+ * degrade to RRF-only ordering instead of failing the whole query.
+ */
+export class RerankUnavailableError extends Error {
+  /** Which backend was attempted: "remote" or "local". */
+  readonly backend: string;
+
+  constructor(message: string, backend: string, cause?: unknown) {
+    super(message, cause !== undefined ? { cause } : undefined);
+    this.name = "RerankUnavailableError";
+    this.backend = backend;
+  }
+}
+
+/**
  * Model info
  */
 export type ModelInfo = {

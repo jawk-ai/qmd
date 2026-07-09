@@ -8,7 +8,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
 import { RemoteLLM, remoteConfigFromEnv, computeRetryDelayMs, type RemoteLLMConfig } from "../src/remote-llm.js";
 import { HybridLLM } from "../src/hybrid-llm.js";
-import { isRemoteModel, formatQueryForEmbedding, formatDocForEmbedding, getDefaultLLM, setDefaultLLM, LlamaCpp } from "../src/llm.js";
+import { isRemoteModel, formatQueryForEmbedding, formatDocForEmbedding, getDefaultLLM, setDefaultLLM, LlamaCpp, RerankUnavailableError } from "../src/llm.js";
 import type { LLM, EmbeddingResult, RerankResult, Queryable, GenerateResult, ModelInfo } from "../src/llm.js";
 
 // =============================================================================
@@ -512,6 +512,15 @@ describe("RemoteLLM", () => {
         llm.rerank("query", [{ file: "a.md", text: "text" }])
       ).rejects.toThrow("rerankApiModel");
     });
+
+    it("supportsRerank / rerankModelName reflect config", () => {
+      expect(createRemoteLLM().supportsRerank).toBe(false);
+      expect(createRemoteLLM().rerankModelName).toBeUndefined();
+
+      const configured = createRemoteLLM({ rerankApiModel: "rerank-model" });
+      expect(configured.supportsRerank).toBe(true);
+      expect(configured.rerankModelName).toBe("rerank-model");
+    });
   });
 
   describe("unsupported operations", () => {
@@ -774,6 +783,120 @@ describe("HybridLLM", () => {
     const hybrid = new HybridLLM(remote, local);
 
     expect(hybrid.embedModelName).toBe("BAAI/bge-m3");
+  });
+
+  // ===========================================================================
+  // rerank routing (E3-1): local fallback when no remote rerank endpoint
+  // ===========================================================================
+
+  describe("rerank routing", () => {
+    // Local mock that records rerank calls and returns a distinguishable result.
+    function createTrackingLocalLLM(): LLM & { rerankCalls: number; rerankModelName: string } {
+      const base = createMockLocalLLM() as LLM & { rerankCalls: number; rerankModelName: string };
+      base.rerankCalls = 0;
+      base.rerankModelName = "local-rerank-model";
+      base.rerank = async (_query, documents) => {
+        base.rerankCalls++;
+        // Reverse candidate order so we can detect that local actually ran.
+        return {
+          results: documents.map((d, i) => ({ file: d.file, score: 1 - i * 0.1, index: i })).reverse(),
+          model: "local-rerank-model",
+        };
+      };
+      return base;
+    }
+
+    const docs = [
+      { file: "a.md", text: "doc A text" },
+      { file: "b.md", text: "doc B text" },
+    ];
+
+    it("falls back to the LOCAL reranker when no remote rerank endpoint is configured", async () => {
+      let remoteHit = false;
+      setMockHandler(() => {
+        remoteHit = true;
+        return { status: 200, body: { results: [] } };
+      });
+
+      const remote = createRemoteLLM(); // embed only, no rerankApiModel
+      const local = createTrackingLocalLLM();
+      const hybrid = new HybridLLM(remote, local);
+
+      expect(hybrid.rerankBackend).toBe("local");
+      expect(hybrid.rerankModelName).toBe("local-rerank-model");
+
+      const result = await hybrid.rerank("q", docs);
+      expect(local.rerankCalls).toBe(1);
+      expect(remoteHit).toBe(false);
+      expect(result.model).toBe("local-rerank-model");
+      expect(result.results).toHaveLength(2);
+    });
+
+    it("routes to the REMOTE reranker when rerankApiModel is configured", async () => {
+      setMockHandler((_req, body) => {
+        const parsed = JSON.parse(body);
+        expect(parsed.model).toBe("remote-rerank-model");
+        return {
+          status: 200,
+          body: {
+            results: [
+              { index: 1, relevance_score: 0.9 },
+              { index: 0, relevance_score: 0.2 },
+            ],
+          },
+        };
+      });
+
+      const remote = createRemoteLLM({ rerankApiModel: "remote-rerank-model" });
+      const local = createTrackingLocalLLM();
+      const hybrid = new HybridLLM(remote, local);
+
+      expect(hybrid.rerankBackend).toBe("remote");
+      expect(hybrid.rerankModelName).toBe("remote-rerank-model");
+
+      const result = await hybrid.rerank("q", docs);
+      expect(local.rerankCalls).toBe(0); // remote used, local untouched
+      expect(result.model).toBe("remote-rerank-model");
+      expect(result.results.find(r => r.file === "b.md")!.score).toBe(0.9);
+    });
+
+    it("wraps a LOCAL rerank failure in RerankUnavailableError (graceful RRF degradation)", async () => {
+      const remote = createRemoteLLM(); // local backend selected
+      const local = createMockLocalLLM();
+      local.rerank = async () => {
+        // e.g. no GGUF present / node-llama-cpp init failed — message has NO "rerank"
+        throw new Error("Model file is not valid GGUF");
+      };
+      const hybrid = new HybridLLM(remote, local);
+
+      await expect(hybrid.rerank("q", docs)).rejects.toBeInstanceOf(RerankUnavailableError);
+      await expect(hybrid.rerank("q", docs)).rejects.toThrow(/local rerank failed/i);
+    });
+
+    it("wraps a REMOTE rerank failure in RerankUnavailableError", async () => {
+      setMockHandler(() => ({ status: 500, body: { error: "boom" } }));
+
+      const remote = createRemoteLLM({ rerankApiModel: "remote-rerank-model" });
+      const local = createMockLocalLLM();
+      const hybrid = new HybridLLM(remote, local);
+
+      await expect(hybrid.rerank("q", docs)).rejects.toBeInstanceOf(RerankUnavailableError);
+    });
+
+    it("short-circuits empty candidate lists without hitting any backend", async () => {
+      let remoteHit = false;
+      setMockHandler(() => {
+        remoteHit = true;
+        return { status: 200, body: { results: [] } };
+      });
+      const local = createTrackingLocalLLM();
+      const hybrid = new HybridLLM(createRemoteLLM(), local);
+
+      const result = await hybrid.rerank("q", []);
+      expect(result.results).toEqual([]);
+      expect(local.rerankCalls).toBe(0);
+      expect(remoteHit).toBe(false);
+    });
   });
 });
 

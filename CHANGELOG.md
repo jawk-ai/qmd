@@ -2,6 +2,29 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Rerank now falls back to the local llama.cpp reranker when no remote rerank
+  endpoint is configured.** Previously `HybridLLM` routed reranking
+  unconditionally to the remote backend, so a deployment with remote embedding
+  (`QMD_EMBED_API_*`) but no `QMD_RERANK_API_MODEL` — the common remote-Gemini
+  embed case — silently skipped reranking entirely and returned RRF-only
+  results. Reranking now runs on the local reranker in that case. Remote
+  reranking is still used when `QMD_RERANK_API_MODEL` is set, and any rerank
+  failure (missing GGUF, native init failure, remote 5xx/circuit-breaker) still
+  degrades gracefully to RRF-only ordering instead of failing the query.
+
+### Added
+
+- **Rerank observability.** `HybridLLM.rerank` emits structured single-line
+  stderr diagnostics (`qmd.rerank {…}`) for the start/done/fallback phases,
+  including the effective backend (`remote`/`local`), candidate count, and
+  duration in ms.
+- **Truthful rerank-backend reporting.** `qmd status` and `qmd doctor` now
+  report the *effective* rerank backend (remote endpoint vs. local llama.cpp),
+  and `qmd doctor` warns when remote embed is configured but rerank silently
+  falls back to the local model.
+
 ## [2.6.3-jawk.1] - 2026-07-09
 
 ### Changed
