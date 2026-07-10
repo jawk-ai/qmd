@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [2.6.3-jawk.2] - 2026-07-10
+
 ### Fixed
 
 - **Rerank now falls back to the local llama.cpp reranker when no remote rerank
