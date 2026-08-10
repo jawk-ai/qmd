@@ -22,6 +22,7 @@ import type {
 } from "./llm.js";
 import { RerankUnavailableError } from "./llm.js";
 import { RemoteLLM } from "./remote-llm.js";
+import { getRequestSignal } from "./request-context.js";
 
 export class HybridLLM implements LLM {
   constructor(
@@ -114,32 +115,62 @@ export class HybridLLM implements LLM {
       return { results: [], model: this.rerankModelName ?? "" };
     }
 
-    const target = backend === "remote" ? this.remote : this.local;
-    const startedAt = Date.now();
-    logRerankEvent({ event: "start", backend, candidates: candidateCount });
+    // The caller's client may already be gone (timeout + retry is the
+    // pathological case from #105) — don't spend CPU/API calls scoring
+    // candidates nobody will read.
+    const signal = getRequestSignal();
+    if (signal?.aborted) {
+      logRerankEvent({ event: "skipped", backend, candidates: candidateCount, reason: "client disconnected" });
+      throw new RerankUnavailableError(`${backend} rerank skipped: client disconnected`, backend);
+    }
 
+    const target = backend === "remote" ? this.remote : this.local;
+
+    // Local rerank is CPU-bound (qwen3-reranker-0.6b via llama.cpp, no GPU)
+    // and a single job already parallelizes across every available context —
+    // it can saturate all cores on its own. Running more than one job at once
+    // adds no throughput, only contention: this is exactly how a client that
+    // times out and retries turned into an unbounded pile of zombie jobs
+    // fighting for the same 4 cores (#105). Bound it so retries queue instead
+    // of thrashing. Remote rerank offloads to a GPU-heavy endpoint elsewhere
+    // and doesn't compete for this process's CPU, so it bypasses the gate.
+    const release = backend === "local" ? await localRerankSemaphore.acquire() : undefined;
     try {
-      const result = await target.rerank(query, documents, options);
-      logRerankEvent({
-        event: "done",
-        backend,
-        candidates: candidateCount,
-        durationMs: Date.now() - startedAt,
-        model: result.model,
-      });
-      return result;
-    } catch (err) {
-      const reason = err instanceof Error ? err.message : String(err);
-      logRerankEvent({
-        event: "fallback",
-        backend,
-        candidates: candidateCount,
-        durationMs: Date.now() - startedAt,
-        reason,
-      });
-      // Tag the failure so the pipeline reliably degrades to RRF-only ordering
-      // rather than surfacing a raw (possibly non-"rerank") error to the query.
-      throw new RerankUnavailableError(`${backend} rerank failed: ${reason}`, backend, err);
+      // Re-check after any queueing wait — the client may have given up
+      // while this job was queued behind an earlier one.
+      if (signal?.aborted) {
+        logRerankEvent({ event: "skipped", backend, candidates: candidateCount, reason: "client disconnected while queued" });
+        throw new RerankUnavailableError(`${backend} rerank skipped: client disconnected while queued`, backend);
+      }
+
+      const startedAt = Date.now();
+      logRerankEvent({ event: "start", backend, candidates: candidateCount });
+
+      try {
+        const result = await target.rerank(query, documents, options);
+        logRerankEvent({
+          event: "done",
+          backend,
+          candidates: candidateCount,
+          durationMs: Date.now() - startedAt,
+          model: result.model,
+        });
+        return result;
+      } catch (err) {
+        const reason = err instanceof Error ? err.message : String(err);
+        logRerankEvent({
+          event: "fallback",
+          backend,
+          candidates: candidateCount,
+          durationMs: Date.now() - startedAt,
+          reason,
+        });
+        // Tag the failure so the pipeline reliably degrades to RRF-only ordering
+        // rather than surfacing a raw (possibly non-"rerank") error to the query.
+        throw new RerankUnavailableError(`${backend} rerank failed: ${reason}`, backend, err);
+      }
+    } finally {
+      release?.();
     }
   }
 
@@ -183,8 +214,8 @@ export class HybridLLM implements LLM {
 // =============================================================================
 
 type RerankLogEvent = {
-  /** Lifecycle phase: rerank started, completed, or fell back to RRF. */
-  event: "start" | "done" | "fallback";
+  /** Lifecycle phase: rerank started, completed, fell back to RRF, or was skipped for a disconnected client. */
+  event: "start" | "done" | "fallback" | "skipped";
   /** Which backend was used. */
   backend: "remote" | "local";
   /** Number of candidate documents passed to the reranker. */
@@ -193,7 +224,7 @@ type RerankLogEvent = {
   durationMs?: number;
   /** Effective rerank model (done only). */
   model?: string;
-  /** Failure reason (fallback only). */
+  /** Failure reason (fallback only) or skip reason (skipped only). */
   reason?: string;
 };
 
@@ -206,3 +237,60 @@ type RerankLogEvent = {
 function logRerankEvent(fields: RerankLogEvent): void {
   process.stderr.write(`qmd.rerank ${JSON.stringify(fields)}\n`);
 }
+
+// =============================================================================
+// Local-backend rerank concurrency bound (#105)
+// =============================================================================
+
+/**
+ * Simple counting semaphore. `acquire()` resolves with a release function;
+ * queued waiters are handed the freed permit directly by `release()` so the
+ * total permit count is always conserved.
+ */
+class Semaphore {
+  private available: number;
+  private readonly queue: Array<() => void> = [];
+
+  constructor(permits: number) {
+    this.available = permits;
+  }
+
+  acquire(): Promise<() => void> {
+    if (this.available > 0) {
+      this.available--;
+      return Promise.resolve(() => this.release());
+    }
+    return new Promise<() => void>((resolve) => {
+      this.queue.push(() => resolve(() => this.release()));
+    });
+  }
+
+  private release(): void {
+    const next = this.queue.shift();
+    if (next) {
+      next(); // hand the freed permit straight to the next waiter
+    } else {
+      this.available++;
+    }
+  }
+}
+
+/**
+ * Max simultaneous LOCAL rerank jobs. Defaults to 1 — see the comment on
+ * `rerank()` for why more than one is pure contention, not throughput.
+ * Override via `QMD_RERANK_MAX_CONCURRENCY` for hardware with real headroom
+ * (many cores, or a build that offloads the local reranker to GPU).
+ */
+function resolveRerankConcurrency(envValue = process.env.QMD_RERANK_MAX_CONCURRENCY): number {
+  const normalized = envValue?.trim() ?? "";
+  if (!normalized) return 1;
+
+  const parsed = Number(normalized);
+  if (!Number.isInteger(parsed) || parsed < 1) {
+    process.stderr.write(`QMD Warning: invalid QMD_RERANK_MAX_CONCURRENCY="${envValue}", using 1.\n`);
+    return 1;
+  }
+  return parsed;
+}
+
+const localRerankSemaphore = new Semaphore(resolveRerankConcurrency());

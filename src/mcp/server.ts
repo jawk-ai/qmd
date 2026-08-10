@@ -31,6 +31,7 @@ import {
 } from "../index.js";
 import { getConfigPath } from "../collections.js";
 import { enableProductionMode } from "../store.js";
+import { runWithRequestSignal } from "../request-context.js";
 
 // =============================================================================
 // Types for structured content
@@ -767,7 +768,12 @@ export async function startMcpHttpServer(
           ? explicitCollections
           : omittedCollectionsFilter;
 
-        const results = await store.search({
+        const restAbortController = new AbortController();
+        nodeRes.on("close", () => {
+          if (!nodeRes.writableEnded) restAbortController.abort();
+        });
+
+        const results = await runWithRequestSignal(restAbortController.signal, () => store.search({
           queries,
           collections: effectiveCollections && effectiveCollections.length > 0 ? effectiveCollections : undefined,
           limit: typeof params.limit === "number" ? params.limit : 10,
@@ -775,7 +781,7 @@ export async function startMcpHttpServer(
           candidateLimit: typeof params.candidateLimit === "number" ? params.candidateLimit : undefined,
           intent: typeof params.intent === "string" ? params.intent : undefined,
           rerank: typeof params.rerank === "boolean" ? params.rerank : undefined,
-        });
+        }));
 
         // Use first lex or vec query for snippet extraction
         const primaryQuery = searches.find((s) => s.type === 'lex')?.query
@@ -840,7 +846,19 @@ export async function startMcpHttpServer(
         }
 
         const request = new Request(url, { method: "POST", headers, body: rawBody });
-        const response = await transport.handleRequest(request, { parsedBody: body });
+
+        // Detect a client that gives up before we respond (timeout, retry,
+        // reverse-proxy disconnect) — 'close' fires on both normal completion
+        // and premature disconnect, so only treat it as cancellation when we
+        // haven't finished writing a response yet (#105).
+        const abortController = new AbortController();
+        nodeRes.on("close", () => {
+          if (!nodeRes.writableEnded) abortController.abort();
+        });
+
+        const response = await runWithRequestSignal(abortController.signal, () =>
+          transport.handleRequest(request, { parsedBody: body })
+        );
 
         nodeRes.writeHead(response.status, Object.fromEntries(response.headers));
         nodeRes.end(Buffer.from(await response.arrayBuffer()));
