@@ -32,6 +32,13 @@ Features **required** by qmd-hub prod that upstream does not ship today:
 - **Embed session timeout override** — `--session-max-ms` / `QMD_EMBED_SESSION_MAX_MS`
 - **Parallel embed dispatch** with configurable batch size and 429/5xx backoff
 - **Gemini embed index fallback** — positional mapping when API omits `data[].index`
+- **Local rerank concurrency bound + client-disconnect cancellation** — caps
+  simultaneous local (llama.cpp) rerank jobs via `QMD_RERANK_MAX_CONCURRENCY`
+  (default `1`) and skips queued rerank work for clients that already
+  disconnected, via an `AsyncLocalStorage`-based ambient signal
+  (`src/request-context.ts`) threaded from the MCP HTTP server. Fixes
+  [jawk-ai/qmd-hub#105](https://github.com/jawk-ai/qmd-hub/issues/105)
+  (zombie rerank job pileup).
 
 ## Version tags
 

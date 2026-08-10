@@ -1076,6 +1076,7 @@ llm_cache       -- Cached LLM responses (query expansion, rerank scores)
 | `QMD_LLAMA_GPU` | `auto` | Force llama.cpp GPU backend (`metal`, `vulkan`, `cuda`) or disable GPU with `false` |
 | `QMD_FORCE_CPU` | unset | Set to `1`/`true` to force CPU mode before any CUDA/Vulkan/Metal probing. Equivalent CLI flag: `--no-gpu`. |
 | `QMD_EMBED_PARALLELISM` | automatic | Override embedding/reranking context parallelism (1-8). Windows CUDA defaults to `1` because parallel CUDA contexts can crash with `ggml-cuda.cu:98`; use Vulkan or raise this only if your driver is stable. |
+| `QMD_RERANK_MAX_CONCURRENCY` | `1` | Max simultaneous **local** rerank jobs (llama.cpp, CPU-bound). A single job already parallelizes across every available context and can saturate all cores on its own, so raising this adds contention, not throughput, on typical hardware — only raise it if you have real headroom (many cores, or a build that offloads the local reranker to GPU). Does not apply to remote reranking (`QMD_RERANK_API_MODEL`), which isn't CPU-bound here. |
 
 ## How It Works
 
