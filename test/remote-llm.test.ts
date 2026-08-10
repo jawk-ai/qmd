@@ -8,6 +8,7 @@ import { describe, it, expect, beforeAll, afterAll, beforeEach, afterEach } from
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "http";
 import { RemoteLLM, remoteConfigFromEnv, computeRetryDelayMs, type RemoteLLMConfig } from "../src/remote-llm.js";
 import { HybridLLM } from "../src/hybrid-llm.js";
+import { runWithRequestSignal } from "../src/request-context.js";
 import { isRemoteModel, formatQueryForEmbedding, formatDocForEmbedding, getDefaultLLM, setDefaultLLM, LlamaCpp, RerankUnavailableError } from "../src/llm.js";
 import type { LLM, EmbeddingResult, RerankResult, Queryable, GenerateResult, ModelInfo } from "../src/llm.js";
 
@@ -896,6 +897,164 @@ describe("HybridLLM", () => {
       expect(result.results).toEqual([]);
       expect(local.rerankCalls).toBe(0);
       expect(remoteHit).toBe(false);
+    });
+  });
+
+  // ===========================================================================
+  // rerank concurrency bound & cancellation (#105)
+  // ===========================================================================
+
+  describe("rerank concurrency & cancellation (#105)", () => {
+    function createMockLocalLLM(): LLM {
+      return {
+        embedModelName: "local-model",
+        embed: async () => ({ embedding: [0.5], model: "local-model" }),
+        embedBatch: async (texts) => texts.map(() => ({ embedding: [0.5], model: "local-model" })),
+        generate: async () => ({ text: "expanded", model: "local-model", done: true }),
+        modelExists: async (model) => ({ name: model, exists: true }),
+        expandQuery: async () => [{ type: "lex" as const, text: "expanded query" }],
+        rerank: async () => ({ results: [], model: "local-model" }),
+        dispose: async () => {},
+      };
+    }
+
+    function createTrackingLocalLLM(): LLM & { rerankCalls: number; rerankModelName: string } {
+      const base = createMockLocalLLM() as LLM & { rerankCalls: number; rerankModelName: string };
+      base.rerankCalls = 0;
+      base.rerankModelName = "local-rerank-model";
+      base.rerank = async (_query, documents) => {
+        base.rerankCalls++;
+        return { results: documents.map((d) => ({ file: d.file, score: 1, index: 0 })), model: "local-rerank-model" };
+      };
+      return base;
+    }
+
+    const docs = [
+      { file: "a.md", text: "doc A text" },
+      { file: "b.md", text: "doc B text" },
+    ];
+
+    it("runs at most one LOCAL rerank job at a time by default", async () => {
+      const remote = createRemoteLLM(); // local backend selected
+      let inFlight = 0;
+      let maxInFlight = 0;
+      const pendingReleases: Array<() => void> = [];
+      const local = createMockLocalLLM();
+      local.rerank = async (_q, documents) => {
+        inFlight++;
+        maxInFlight = Math.max(maxInFlight, inFlight);
+        await new Promise<void>((resolve) => pendingReleases.push(resolve));
+        inFlight--;
+        return { results: documents.map((d) => ({ file: d.file, score: 1, index: 0 })), model: "local-rerank-model" };
+      };
+      const hybrid = new HybridLLM(remote, local);
+
+      const p1 = hybrid.rerank("q1", docs);
+      const p2 = hybrid.rerank("q2", docs);
+
+      // Only job 1 should have entered the reranker; job 2 is queued behind
+      // the semaphore, not running concurrently.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(inFlight).toBe(1);
+      expect(pendingReleases).toHaveLength(1);
+
+      pendingReleases[0]!();
+      await p1;
+
+      // Job 2 only starts once job 1 releases the slot.
+      await new Promise((resolve) => setTimeout(resolve, 20));
+      expect(pendingReleases).toHaveLength(2);
+
+      pendingReleases[1]!();
+      await p2;
+
+      expect(maxInFlight).toBe(1);
+    });
+
+    it("does not gate REMOTE rerank behind the local concurrency limit", async () => {
+      setMockHandler(() => ({
+        status: 200,
+        body: { results: [{ index: 0, relevance_score: 0.9 }, { index: 1, relevance_score: 0.1 }] },
+      }));
+
+      // localRerankSemaphore is a module-level singleton shared by every
+      // HybridLLM instance in the process — hold its one permit with a
+      // separate local-backend instance and prove a REMOTE-backend instance
+      // still completes promptly instead of queueing behind it.
+      let releaseLocalJob: () => void = () => {};
+      const localGate = new Promise<void>((resolve) => (releaseLocalJob = resolve));
+      const localHoldingLLM = createMockLocalLLM();
+      localHoldingLLM.rerank = async () => {
+        await localGate;
+        return { results: [], model: "local-model" };
+      };
+      const hybridLocal = new HybridLLM(createRemoteLLM(), localHoldingLLM);
+      const occupyingJob = hybridLocal.rerank("occupy", docs);
+
+      try {
+        await new Promise((resolve) => setTimeout(resolve, 20)); // let it grab the only permit
+
+        const remote = createRemoteLLM({ rerankApiModel: "remote-rerank-model" });
+        const local = createTrackingLocalLLM();
+        const hybridRemote = new HybridLLM(remote, local);
+
+        const result = await Promise.race([
+          hybridRemote.rerank("q", docs),
+          new Promise<"timeout">((resolve) => setTimeout(() => resolve("timeout"), 500)),
+        ]);
+
+        expect(result).not.toBe("timeout");
+        expect(local.rerankCalls).toBe(0); // remote path never touches the local gate
+      } finally {
+        releaseLocalJob();
+        await occupyingJob;
+      }
+    });
+
+    it("skips LOCAL rerank when the ambient request signal is already aborted", async () => {
+      const remote = createRemoteLLM();
+      const local = createTrackingLocalLLM();
+      const hybrid = new HybridLLM(remote, local);
+
+      const controller = new AbortController();
+      controller.abort();
+
+      await runWithRequestSignal(controller.signal, async () => {
+        await expect(hybrid.rerank("q", docs)).rejects.toBeInstanceOf(RerankUnavailableError);
+        await expect(hybrid.rerank("q", docs)).rejects.toThrow(/client disconnected/i);
+      });
+
+      expect(local.rerankCalls).toBe(0);
+    });
+
+    it("skips a queued LOCAL rerank job if its client disconnects before its turn runs", async () => {
+      const remote = createRemoteLLM();
+      const local = createTrackingLocalLLM();
+      let releaseJob1: () => void = () => {};
+      const job1Gate = new Promise<void>((resolve) => (releaseJob1 = resolve));
+      local.rerank = async (_q, documents) => {
+        await job1Gate;
+        local.rerankCalls++;
+        return { results: documents.map((d) => ({ file: d.file, score: 1, index: 0 })), model: "local-rerank-model" };
+      };
+      const hybrid = new HybridLLM(remote, local);
+
+      const controller1 = new AbortController();
+      const controller2 = new AbortController();
+
+      const p1 = runWithRequestSignal(controller1.signal, () => hybrid.rerank("q1", docs));
+      await new Promise((resolve) => setTimeout(resolve, 20)); // job 1 grabs the only permit
+
+      const p2 = runWithRequestSignal(controller2.signal, () => hybrid.rerank("q2", docs));
+      await new Promise((resolve) => setTimeout(resolve, 20)); // job 2 is now queued behind job 1
+
+      controller2.abort(); // client 2 gives up while its job is still queued
+
+      releaseJob1();
+      await p1;
+
+      await expect(p2).rejects.toThrow(/disconnected while queued/i);
+      expect(local.rerankCalls).toBe(1); // only job 1 ever actually ran the reranker
     });
   });
 });

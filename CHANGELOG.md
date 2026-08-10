@@ -2,6 +2,27 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- **Zombie rerank job pileup (#105).** A client that times out and retries no
+  longer leaves its rerank job running unbounded in the background. Two
+  independent fixes, either of which would have prevented the observed
+  incident on its own:
+  - `HybridLLM.rerank` now bounds **local** reranking (CPU-bound
+    `qwen3-reranker` via llama.cpp, no GPU) to one job at a time by default —
+    a single job already saturates every available core, so more than one
+    running concurrently is pure contention, not throughput. Retries now
+    queue instead of thrashing. Override with `QMD_RERANK_MAX_CONCURRENCY`.
+    Remote reranking is unaffected (it doesn't compete for local CPU).
+  - The MCP HTTP server (`src/mcp/server.ts`) now detects a client that
+    disconnects before a response is sent and threads an ambient abort
+    signal (`src/request-context.ts`, `AsyncLocalStorage`-based) down to
+    `HybridLLM.rerank`, which skips the reranker entirely — before starting,
+    or after waiting in the new concurrency queue — once the client is
+    already gone. (The MCP SDK's own cancellation only fires on an explicit
+    `notifications/cancelled` message, which a plain `fetch` + timeout client
+    never sends — this closes that gap at the HTTP layer instead.)
+
 ## [2.6.3-jawk.2] - 2026-07-10
 
 ### Fixed
