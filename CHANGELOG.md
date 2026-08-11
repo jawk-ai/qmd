@@ -39,6 +39,21 @@
     `notifications/cancelled` message, which a plain `fetch` + timeout client
     never sends — this closes that gap at the HTTP layer instead.)
 
+- **Inactivity-disposal race disposing a still-running `embed`/`rerank`/
+  `expandQuery`/`generate` call (#143).** `LlamaCpp`'s 5-minute idle-unload
+  timer only deferred to the global `getDefaultLLM()` session manager
+  (`canUnloadLLM()`) — any caller holding its **own** `LlamaCpp` instance
+  (e.g. qmd-hub's per-store `new LlamaCpp(...)`), or any call that never went
+  through a session at all (`store.ts`'s search-time `rerank`/`embed` calls
+  called the LLM directly), was invisible to it. A single local rerank job
+  that legitimately ran longer than the timeout — easily reached on a full,
+  unscoped corpus with the default 40-candidate limit — got its models and
+  contexts disposed out from under it mid-call, failing with `Object is
+  disposed` instead of completing. Every `LlamaCpp` instance now tracks its
+  own in-flight `embed`/`embedBatch`/`expandQuery`/`generate`/`rerank` calls
+  and the idle timer defers to that count directly, regardless of which
+  instance is asking or whether the caller used a session.
+
 ## [2.6.3-jawk.2] - 2026-07-10
 
 ### Fixed

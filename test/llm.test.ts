@@ -535,6 +535,77 @@ describe("LlamaCpp rerank deduping", () => {
   });
 });
 
+describe("LlamaCpp inactivity-disposal vs. a long-running in-flight call (#143)", () => {
+  test("sanity: the mocked inactivity timer disposes resources when nothing is tracked as busy", async () => {
+    // Proves the harness below is actually capable of observing disposal —
+    // this is what a rerank() call would have looked like before #143's fix,
+    // since it never incremented any per-instance in-flight counter.
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 30, disposeModelsOnInactivity: true }) as any;
+    llm.hasLoadedContexts = vi.fn(() => true);
+    const unloadIdleResources = vi.fn(async () => {});
+    llm.unloadIdleResources = unloadIdleResources;
+
+    llm.touchActivity();
+    await new Promise((resolve) => setTimeout(resolve, 90));
+
+    expect(unloadIdleResources).toHaveBeenCalled();
+  });
+
+  test("rerank() calls that outlive inactivityTimeoutMs are not disposed mid-flight", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 30, disposeModelsOnInactivity: true }) as any;
+    llm._ciMode = false; // allow unit test even in CI (mocked, no real models)
+    llm.hasLoadedContexts = vi.fn(() => true);
+
+    const unloadIdleResources = vi.fn(async () => {});
+    llm.unloadIdleResources = unloadIdleResources;
+
+    const rankAll = vi.fn(async (_query: string, docs: string[]) => {
+      // Outlives several 30ms inactivity-timer windows while genuinely "in flight".
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return docs.map(() => 0.5);
+    });
+    llm.ensureRerankContexts = vi.fn().mockResolvedValue([{ rankAll }]);
+    llm.ensureRerankModel = vi.fn().mockResolvedValue({
+      tokenize: (text: string) => Array.from(text),
+      detokenize: (tokens: string[]) => tokens.join(""),
+    });
+
+    const result = await llm.rerank("q", [{ file: "a.md", text: "doc" }]);
+
+    expect(result.results).toHaveLength(1);
+    expect(result.results[0]!.score).toBe(0.5);
+    // The timer fired multiple times during the 150ms call (30ms timeout)
+    // but must have rescheduled instead of disposing mid-flight.
+    expect(unloadIdleResources).not.toHaveBeenCalled();
+  });
+
+  test("embed() calls that outlive inactivityTimeoutMs are not disposed mid-flight", async () => {
+    const llm = new LlamaCpp({ inactivityTimeoutMs: 30, disposeModelsOnInactivity: true }) as any;
+    llm.hasLoadedContexts = vi.fn(() => true);
+
+    const unloadIdleResources = vi.fn(async () => {});
+    llm.unloadIdleResources = unloadIdleResources;
+
+    const getEmbeddingFor = vi.fn(async (text: string) => {
+      await new Promise((resolve) => setTimeout(resolve, 150));
+      return { vector: new Float32Array([0.1, 0.2]), text };
+    });
+    llm.embedModel = {
+      trainContextSize: 8192,
+      tokenize: (text: string) => Array.from({ length: text.length }, () => 1),
+      detokenize: (tokens: readonly number[]) => "x".repeat(tokens.length),
+    };
+    llm.ensureEmbedContext = vi.fn().mockResolvedValue({ getEmbeddingFor });
+
+    const result = await llm.embed("hello");
+
+    expect(result.model).toBe(llm.embedModelUri);
+    expect(result.embedding[0]).toBeCloseTo(0.1, 5);
+    expect(result.embedding[1]).toBeCloseTo(0.2, 5);
+    expect(unloadIdleResources).not.toHaveBeenCalled();
+  });
+});
+
 describe("LlamaCpp.getDeviceInfo", () => {
   test("can skip build attempts for status probes", async () => {
     const llm = new LlamaCpp({}) as any;

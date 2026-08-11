@@ -789,6 +789,17 @@ export class LlamaCpp implements LLM {
   private inactivityTimeoutMs: number;
   private disposeModelsOnInactivity: boolean;
 
+  // Counts calls to embed/embedBatch/expandQuery/rerank/generate currently in
+  // progress ON THIS INSTANCE. `canUnloadLLM()` (used below) only tracks the
+  // global `getDefaultLLM()` singleton via `withLLMSession` — callers that
+  // hold their own LlamaCpp instance (e.g. qmd-hub's per-store `new
+  // LlamaCpp(...)`, or any direct `.rerank()`/`.embed()` call that never goes
+  // through a session at all) are invisible to it. Without an instance-local
+  // counter, the inactivity timer can dispose this instance's models/contexts
+  // out from under a call that is still genuinely running — a >5min local
+  // rerank on a large candidate set died mid-flight this way (#143).
+  private _inFlightOperations = 0;
+
   // Track disposal state to prevent double-dispose
   private disposed = false;
 
@@ -835,11 +846,16 @@ export class LlamaCpp implements LLM {
     // Only set timer if we have disposable contexts and timeout is enabled
     if (this.inactivityTimeoutMs > 0 && this.hasLoadedContexts()) {
       this.inactivityTimer = setTimeout(() => {
-        // Check if session manager allows unloading
-        // canUnloadLLM is defined later in this file - it checks the session manager
-        // We use dynamic import pattern to avoid circular dependency issues
-        if (typeof canUnloadLLM === 'function' && !canUnloadLLM()) {
-          // Active sessions/operations - reschedule timer
+        // Check the global session manager (canUnloadLLM, defined later in
+        // this file — dynamic-lookup pattern to avoid circular deps) AND
+        // this instance's own in-flight-operation count. The global check
+        // only covers the getDefaultLLM() singleton via withLLMSession; the
+        // instance-local count covers every call to this specific instance
+        // regardless of whether the caller used a session (#143).
+        const externallyBusy = typeof canUnloadLLM === 'function' && !canUnloadLLM();
+        if (this._inFlightOperations > 0 || externallyBusy) {
+          // Active operation(s) — reschedule timer instead of disposing
+          // out from under a call that is still genuinely running.
           this.touchActivity();
           return;
         }
@@ -1363,7 +1379,21 @@ export class LlamaCpp implements LLM {
     return { text: truncatedText, truncated: true, limit: maxTokens };
   }
 
+  /**
+   * Thin wrapper tracking this call as in-flight for the instance's own
+   * inactivity-disposal guard (#143) — see `_inFlightOperations`. The real
+   * work stays in `embedImpl` unchanged.
+   */
   async embed(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
+    this._inFlightOperations++;
+    try {
+      return await this.embedImpl(text, options);
+    } finally {
+      this._inFlightOperations--;
+    }
+  }
+
+  private async embedImpl(text: string, options: EmbedOptions = {}): Promise<EmbeddingResult | null> {
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
 
@@ -1389,10 +1419,20 @@ export class LlamaCpp implements LLM {
   }
 
   /**
-   * Batch embed multiple texts efficiently
-   * Uses Promise.all for parallel embedding - node-llama-cpp handles batching internally
+   * Batch embed multiple texts efficiently. Uses Promise.all for parallel
+   * embedding - node-llama-cpp handles batching internally. Thin wrapper
+   * tracking this call as in-flight (#143) — see `embed()`.
    */
   async embedBatch(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
+    this._inFlightOperations++;
+    try {
+      return await this.embedBatchImpl(texts, options);
+    } finally {
+      this._inFlightOperations--;
+    }
+  }
+
+  private async embedBatchImpl(texts: string[], options: EmbedOptions = {}): Promise<(EmbeddingResult | null)[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1459,7 +1499,17 @@ export class LlamaCpp implements LLM {
     }
   }
 
+  /** Thin wrapper tracking this call as in-flight (#143) — see `embed()`. */
   async generate(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
+    this._inFlightOperations++;
+    try {
+      return await this.generateImpl(prompt, options);
+    } finally {
+      this._inFlightOperations--;
+    }
+  }
+
+  private async generateImpl(prompt: string, options: GenerateOptions = {}): Promise<GenerateResult | null> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1520,7 +1570,17 @@ export class LlamaCpp implements LLM {
   // High-level abstractions
   // ==========================================================================
 
+  /** Thin wrapper tracking this call as in-flight (#143) — see `embed()`. */
   async expandQuery(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
+    this._inFlightOperations++;
+    try {
+      return await this.expandQueryImpl(query, options);
+    } finally {
+      this._inFlightOperations--;
+    }
+  }
+
+  private async expandQueryImpl(query: string, options: { context?: string, includeLexical?: boolean, intent?: string } = {}): Promise<Queryable[]> {
     if (this._ciMode) throw new Error("LLM operations are disabled in CI (set CI=true)");
     // Ping activity at start to keep models alive during this operation
     this.touchActivity();
@@ -1620,7 +1680,21 @@ export class LlamaCpp implements LLM {
   private static readonly RERANK_TEMPLATE_OVERHEAD = 512;
   private static readonly RERANK_TARGET_DOCS_PER_CONTEXT = 10;
 
+  /** Thin wrapper tracking this call as in-flight (#143) — see `embed()`. */
   async rerank(
+    query: string,
+    documents: RerankDocument[],
+    options: RerankOptions = {}
+  ): Promise<RerankResult> {
+    this._inFlightOperations++;
+    try {
+      return await this.rerankImpl(query, documents, options);
+    } finally {
+      this._inFlightOperations--;
+    }
+  }
+
+  private async rerankImpl(
     query: string,
     documents: RerankDocument[],
     options: RerankOptions = {}
