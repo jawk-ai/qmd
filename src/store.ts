@@ -5049,6 +5049,14 @@ async function rerankAndBlend(
     skipRerank?: boolean;
     chunkStrategy?: ChunkStrategy;
     hooks?: SearchHooks;
+    /** Rank (1-indexed) to use for each candidate's position-blend weight,
+     *  parallel to `candidates`. Defaults to array position (`i + 1`) — the
+     *  correct behavior for hybridQuery()'s own candidates, which are never
+     *  compressed after fusion. rerankExternalCandidates() must supply this
+     *  explicitly: dropping an unresolved candidate shifts array position
+     *  but must NOT shift rank (Bugbot finding, jawk-ai/qmd#8 — see
+     *  resolveCandidatesByHash's `ranks` return value). */
+    ranks?: number[];
   }
 ): Promise<HybridQueryResult[]> {
   const limit = options.limit ?? 10;
@@ -5095,7 +5103,7 @@ async function rerankAndBlend(
         const bestIdx = chunkInfo?.bestIdx ?? 0;
         const bestChunk = chunkInfo?.chunks[bestIdx]?.text || cand.body || "";
         const bestChunkPos = chunkInfo?.chunks[bestIdx]?.pos || 0;
-        const rrfRank = i + 1;
+        const rrfRank = options.ranks?.[i] ?? (i + 1);
         const rrfScore = 1 / rrfRank;
         const trace = rrfTraceByFile?.get(cand.file);
         const explainData: HybridQueryExplain | undefined = explain ? {
@@ -5155,7 +5163,7 @@ async function rerankAndBlend(
   const candidateMap = new Map(candidates.map(c => [c.file, {
     displayPath: c.displayPath, title: c.title, body: c.body,
   }]));
-  const rrfRankMap = new Map(candidates.map((c, i) => [c.file, i + 1]));
+  const rrfRankMap = new Map(candidates.map((c, i) => [c.file, options.ranks?.[i] ?? (i + 1)]));
 
   const blended = reranked.map(r => {
     const rrfRank = rrfRankMap.get(r.file) || candidateLimit;
@@ -5257,10 +5265,10 @@ export interface ExternalCandidate {
 function resolveCandidatesByHash(
   db: Database,
   candidates: ExternalCandidate[]
-): { resolved: RankedResult[]; docidMap: Map<string, string>; unresolvedCount: number } {
+): { resolved: RankedResult[]; ranks: number[]; docidMap: Map<string, string>; unresolvedCount: number } {
   const byKey = new Map<string, { hash: string; collection: string; score: number; firstIndex: number }>();
   candidates.forEach((c, i) => {
-    const key = `${c.collection} ${c.hash}`;
+    const key = `${c.collection} ${c.hash}`;
     const existing = byKey.get(key);
     if (!existing || c.score > existing.score) {
       byKey.set(key, { hash: c.hash, collection: c.collection, score: c.score, firstIndex: existing?.firstIndex ?? i });
@@ -5270,6 +5278,13 @@ function resolveCandidatesByHash(
 
   const docidMap = new Map<string, string>();
   const resolved: RankedResult[] = [];
+  // Parallel to `resolved` — the caller's ORIGINAL 1-indexed rank for each
+  // surviving candidate, NOT its position in this (possibly compressed)
+  // array. Dropping an unresolvable candidate must not renumber everything
+  // after it: that would silently hand the position-blend weight (step 7)
+  // to whatever now sits at that array index instead of the candidate the
+  // caller actually ranked there (Bugbot finding, jawk-ai/qmd#8).
+  const ranks: number[] = [];
   let unresolvedCount = 0;
 
   const stmt = db.prepare(`
@@ -5283,7 +5298,7 @@ function resolveCandidatesByHash(
     WHERE d.hash = ? AND d.collection = ? AND d.active = 1
   `);
 
-  for (const { hash, collection, score } of ordered) {
+  for (const { hash, collection, score, firstIndex } of ordered) {
     const row = stmt.get(hash, collection) as
       { filepath: string; display_path: string; title: string; body: string } | undefined;
 
@@ -5297,9 +5312,10 @@ function resolveCandidatesByHash(
       body: row.body,
       score,
     });
+    ranks.push(firstIndex + 1);
   }
 
-  return { resolved, docidMap, unresolvedCount };
+  return { resolved, ranks, docidMap, unresolvedCount };
 }
 
 export interface RerankExternalCandidatesOptions {
@@ -5344,7 +5360,7 @@ export async function rerankExternalCandidates(
 ): Promise<RerankExternalCandidatesResult> {
   if (candidates.length === 0) return { results: [], unresolvedCount: 0 };
 
-  const { resolved, docidMap, unresolvedCount } = resolveCandidatesByHash(store.db, candidates);
+  const { resolved, ranks, docidMap, unresolvedCount } = resolveCandidatesByHash(store.db, candidates);
 
   if (resolved.length === 0) return { results: [], unresolvedCount };
 
@@ -5357,6 +5373,7 @@ export async function rerankExternalCandidates(
     skipRerank: options?.rerank === false,
     chunkStrategy: options?.chunkStrategy,
     hooks: options?.hooks,
+    ranks,
   });
 
   return { results, unresolvedCount };

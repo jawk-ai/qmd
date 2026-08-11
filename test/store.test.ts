@@ -3695,6 +3695,43 @@ describe("Embedding batching", () => {
         await cleanupTestDb(store);
       }
     });
+
+    test("dropped unresolved candidates do not renumber the rank of candidates after them", async () => {
+      const store = await createTestStore();
+      await createTestCollection({ name: "docs" });
+      // Flat rerank score for everyone — any blended-score difference must
+      // come from the position-blend rank, isolating exactly the bug this
+      // guards against (Bugbot finding, jawk-ai/qmd#8).
+      store.rerank = vi.fn(async (_q: string, docs: { file: string; text: string }[]) =>
+        docs.map(d => ({ file: d.file, score: 0.5 }))) as any;
+
+      try {
+        const hashReal = await hashContent("# Real\n\nReal document at original rank 11.");
+        await insertTestDocument(store.db, "docs", { name: "real", hash: hashReal, body: "# Real\n\nReal document at original rank 11." });
+
+        // 10 unresolvable candidates ahead of the real one. If dropping them
+        // compresses ranks instead of preserving the caller's original
+        // position, "real" would land at compressed rank 1 (top-3 weight
+        // 0.75) instead of its true rank 11 (beyond-top-10 weight 0.40).
+        const candidates: ExternalCandidate[] = [
+          ...Array.from({ length: 10 }, (_, i) => ({
+            hash: `missing${i}`.padEnd(64, "0"), seq: 0, collection: "docs", score: 0.9,
+          })),
+          { hash: hashReal, seq: 0, collection: "docs", score: 0.5 },
+        ];
+
+        const { results, unresolvedCount } = await rerankExternalCandidates(store, "query", candidates, { limit: 10, minScore: 0 });
+
+        expect(unresolvedCount).toBe(10);
+        expect(results).toHaveLength(1);
+        // rank 11 -> rrfWeight 0.40, rrfScore 1/11.
+        // blended = 0.40*(1/11) + 0.60*0.5. A compressed-rank-1 bug would
+        // instead produce 0.75*1 + 0.25*0.5 = 0.875.
+        expect(results[0]!.score).toBeCloseTo(0.4 * (1 / 11) + 0.6 * 0.5, 5);
+      } finally {
+        await cleanupTestDb(store);
+      }
+    });
   });
 
   test("structuredSearch uses the active llm embed model for precomputed vector lookups", async () => {
