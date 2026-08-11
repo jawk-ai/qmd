@@ -64,6 +64,10 @@ import {
   type EmbedProgress,
   type EmbedResult,
   type ChunkStrategy,
+  rerankExternalCandidates,
+  type ExternalCandidate,
+  type RerankExternalCandidatesOptions,
+  type RerankExternalCandidatesResult,
 } from "./store.js";
 import {
   LlamaCpp,
@@ -109,6 +113,9 @@ export type {
   CollectionConfig,
   NamedCollection,
   ContextMap,
+  ExternalCandidate,
+  RerankExternalCandidatesOptions,
+  RerankExternalCandidatesResult,
 };
 
 // Re-export the internal Store type for advanced consumers
@@ -245,6 +252,20 @@ export interface QMDStore {
 
   /** Expand a query into typed sub-searches (lex/vec/hyde) for manual control */
   expandQuery(query: string, options?: ExpandQueryOptions): Promise<ExpandedQuery[]>;
+
+  /**
+   * Rerank an externally-supplied, pre-ranked candidate list (e.g. from a
+   * vector search run outside qmd) — skips qmd's own FTS/vec retrieval
+   * entirely, reusing only chunk-selection, LLM rerank, and position-blend.
+   * Candidates are addressed by (hash, seq, collection) — qmd's own chunk
+   * identity — since qmd is the sole holder of document bodies. See
+   * ADR 0015 (jawk-ai/qmd-hub#62).
+   */
+  rerankCandidates(
+    query: string,
+    candidates: ExternalCandidate[],
+    options?: RerankExternalCandidatesOptions
+  ): Promise<RerankExternalCandidatesResult>;
 
   // ── Document Retrieval ──────────────────────────────────────────────
 
@@ -446,6 +467,7 @@ export async function createStore(options: StoreOptions): Promise<QMDStore> {
     searchLex: async (q, opts) => internal.searchFTS(q, opts?.limit, opts?.collections ?? opts?.collection),
     searchVector: async (q, opts) => internal.searchVec(q, activeLlm.embedModelName, opts?.limit, opts?.collections ?? opts?.collection),
     expandQuery: async (q, opts) => internal.expandQuery(q, undefined, opts?.intent),
+    rerankCandidates: async (q, candidates, opts) => rerankExternalCandidates(internal, q, candidates, opts),
     get: async (pathOrDocid, opts) => internal.findDocument(pathOrDocid, opts),
     getDocumentBody: async (pathOrDocid, opts) => {
       const result = internal.findDocument(pathOrDocid, { includeBody: false });
