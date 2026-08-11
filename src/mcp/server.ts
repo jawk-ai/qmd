@@ -405,6 +405,74 @@ Intent-aware lex (C++ performance, not sports):
   );
 
   // ---------------------------------------------------------------------------
+  // Tool: rerank_candidates (ADR 0015, jawk-ai/qmd-hub#62 phase 3)
+  //
+  // Machine-to-machine primitive for a caller that already ran its own
+  // retrieval (e.g. the qmd-hub worker's pgvector KNN + BM25 RRF merge)
+  // outside qmd and wants qmd's chunk-selection/rerank/position-blend
+  // without qmd re-running FTS/vec search. Not intended for an LLM client —
+  // deliberately undocumented in terms of retrieval strategy (unlike
+  // `query`), since the caller already made those decisions upstream.
+  // ---------------------------------------------------------------------------
+
+  const externalCandidateSchema = z.object({
+    hash: z.string().describe("Document content hash (qmd's own content-addressing key)"),
+    seq: z.number().describe("Chunk sequence number within the document (accepted for provenance; chunk-selection re-derives its own best chunk)"),
+    collection: z.string().describe("Collection name — required, since the same hash can appear in more than one collection"),
+    score: z.number().describe("Caller-computed relevance score (e.g. RRF-merged). Only used for explain output."),
+  });
+
+  server.registerTool(
+    "rerank_candidates",
+    {
+      title: "Rerank External Candidates",
+      description: `Rerank a pre-ranked candidate list supplied by the caller, without running qmd's own FTS/vector retrieval.
+
+Candidates must be addressed by (hash, seq, collection) — qmd's own chunk identity — because qmd is the sole holder of document bodies; a caller cannot supply chunk text directly without duplicating the corpus.
+
+**\`candidates\` must already be in the caller's final rank order.** Array position stands in for RRF rank in qmd's position-aware score blend (top-3 / top-10 / rest get different reranker-vs-position weighting) — a caller-side re-sort after receiving results would silently invalidate that blend.
+
+Candidates whose (hash, collection) has no active document in this qmd index are dropped silently; \`unresolvedCount\` in the structured response reports how many.`,
+      annotations: { readOnlyHint: true, openWorldHint: false },
+      inputSchema: {
+        query: z.string().describe("The query text to rerank candidates against"),
+        candidates: z.array(externalCandidateSchema).max(200).describe("Pre-ranked candidates, in final rank order"),
+        limit: z.number().optional().default(10).describe("Max results (default: 10)"),
+        minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
+        intent: z.string().optional().describe("Background context to disambiguate the query, same semantics as the query tool's intent"),
+      },
+    },
+    async ({ query, candidates, limit, minScore, intent }) => {
+      const { results, unresolvedCount } = await store.rerankCandidates(query, candidates, {
+        limit,
+        minScore,
+        intent,
+      });
+
+      const filtered: SearchResultItem[] = results.map(r => {
+        const { line, snippet } = extractSnippet(r.body, query, 300, r.bestChunkPos, r.bestChunk.length, intent);
+        return {
+          docid: `#${r.docid}`,
+          file: r.displayPath,
+          title: r.title,
+          score: Math.round(r.score * 100) / 100,
+          context: r.context,
+          line,
+          snippet: addLineNumbers(snippet, line),
+        };
+      });
+
+      const summary = formatSearchSummary(filtered, query)
+        + (unresolvedCount > 0 ? `\n\n(${unresolvedCount} candidate(s) dropped — no matching active document in this qmd index)` : "");
+
+      return {
+        content: [{ type: "text", text: summary }],
+        structuredContent: { results: filtered, unresolvedCount },
+      };
+    }
+  );
+
+  // ---------------------------------------------------------------------------
   // Tool: qmd_get (Retrieve document)
   // ---------------------------------------------------------------------------
 

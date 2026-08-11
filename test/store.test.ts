@@ -58,11 +58,13 @@ import {
   hybridQuery,
   structuredSearch,
   vectorSearchQuery,
+  rerankExternalCandidates,
   type Store,
   type DocumentResult,
   type SearchResult,
   type RankedResult,
   type RankedListMeta,
+  type ExternalCandidate,
 } from "../src/store.js";
 import type { CollectionConfig } from "../src/collections.js";
 
@@ -3531,6 +3533,137 @@ describe("Embedding batching", () => {
     } finally {
       await cleanupTestDb(store);
     }
+  });
+
+  describe("rerankExternalCandidates", () => {
+    test("resolves (hash, collection) candidates to documents and reranks them", async () => {
+      const store = await createTestStore();
+      await createTestCollection({ name: "docs" });
+      const rerankSpy = vi.fn(async (_q: string, docs: { file: string; text: string }[]) =>
+        docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1 })));
+      store.rerank = rerankSpy as any;
+
+      try {
+        const hashA = await hashContent("# Alpha\n\nAlpha content about caching.");
+        const hashB = await hashContent("# Beta\n\nBeta content about queues.");
+        await insertTestDocument(store.db, "docs", { name: "alpha", hash: hashA, body: "# Alpha\n\nAlpha content about caching." });
+        await insertTestDocument(store.db, "docs", { name: "beta", hash: hashB, body: "# Beta\n\nBeta content about queues." });
+
+        const candidates: ExternalCandidate[] = [
+          { hash: hashA, seq: 0, collection: "docs", score: 0.9 },
+          { hash: hashB, seq: 0, collection: "docs", score: 0.5 },
+        ];
+
+        const { results, unresolvedCount } = await rerankExternalCandidates(store, "caching", candidates, { limit: 10, minScore: 0 });
+
+        expect(unresolvedCount).toBe(0);
+        expect(rerankSpy).toHaveBeenCalledTimes(1);
+        expect(results.map(r => r.displayPath).sort()).toEqual(["docs/test/alpha.md", "docs/test/beta.md"].sort());
+        expect(results.every(r => r.docid.length === 6)).toBe(true);
+      } finally {
+        await cleanupTestDb(store);
+      }
+    });
+
+    test("drops candidates whose hash has no active document and counts them", async () => {
+      const store = await createTestStore();
+      await createTestCollection({ name: "docs" });
+      store.rerank = vi.fn(async (_q: string, docs: { file: string; text: string }[]) =>
+        docs.map(d => ({ file: d.file, score: 1 }))) as any;
+
+      try {
+        const hashA = await hashContent("# Real\n\nReal content.");
+        await insertTestDocument(store.db, "docs", { name: "real", hash: hashA, body: "# Real\n\nReal content." });
+
+        const candidates: ExternalCandidate[] = [
+          { hash: hashA, seq: 0, collection: "docs", score: 0.9 },
+          { hash: "deadbeef".repeat(8), seq: 0, collection: "docs", score: 0.8 },
+        ];
+
+        const { results, unresolvedCount } = await rerankExternalCandidates(store, "query", candidates, { limit: 10, minScore: 0 });
+
+        expect(unresolvedCount).toBe(1);
+        expect(results).toHaveLength(1);
+        expect(results[0]!.displayPath).toBe("docs/test/real.md");
+      } finally {
+        await cleanupTestDb(store);
+      }
+    });
+
+    test("disambiguates the same content hash appearing in two different collections", async () => {
+      const store = await createTestStore();
+      await createTestCollection({ name: "docs-a", pwd: "/test/a" });
+      await createTestCollection({ name: "docs-b", pwd: "/test/b" });
+      store.rerank = vi.fn(async (_q: string, docs: { file: string; text: string }[]) =>
+        docs.map(d => ({ file: d.file, score: 1 }))) as any;
+
+      try {
+        const sharedHash = await hashContent("# Shared\n\nIdentical content in two collections.");
+        await insertTestDocument(store.db, "docs-a", { name: "shared", hash: sharedHash, body: "# Shared\n\nIdentical content in two collections." });
+        await insertTestDocument(store.db, "docs-b", { name: "shared", hash: sharedHash, body: "# Shared\n\nIdentical content in two collections." });
+
+        const candidates: ExternalCandidate[] = [
+          { hash: sharedHash, seq: 0, collection: "docs-a", score: 0.9 },
+          { hash: sharedHash, seq: 0, collection: "docs-b", score: 0.8 },
+        ];
+
+        const { results, unresolvedCount } = await rerankExternalCandidates(store, "query", candidates, { limit: 10, minScore: 0 });
+
+        expect(unresolvedCount).toBe(0);
+        expect(results.map(r => r.displayPath).sort()).toEqual(["docs-a/test/shared.md", "docs-b/test/shared.md"]);
+      } finally {
+        await cleanupTestDb(store);
+      }
+    });
+
+    test("caller's array order — not the score field — drives the position-blend weight", async () => {
+      const store = await createTestStore();
+      await createTestCollection({ name: "docs" });
+      // Identical rerank score for both — any blended-score difference must
+      // come from array position (step 7's rrfRank), proving the documented
+      // "candidates must already be in final rank order" contract is real.
+      store.rerank = vi.fn(async (_q: string, docs: { file: string; text: string }[]) =>
+        docs.map(d => ({ file: d.file, score: 0.5 }))) as any;
+
+      try {
+        const hashFirst = await hashContent("# First\n\nFirst doc.");
+        const hashLast = await hashContent("# Last\n\nLast doc, fifteen candidates back.");
+        await insertTestDocument(store.db, "docs", { name: "first", hash: hashFirst, body: "# First\n\nFirst doc." });
+        await insertTestDocument(store.db, "docs", { name: "last", hash: hashLast, body: "# Last\n\nLast doc, fifteen candidates back." });
+
+        // Pad with 13 real filler documents so "last" actually lands at
+        // array position 14 in the RESOLVED candidate list (past the
+        // top-10 position-weight tier) rather than being collapsed forward
+        // by unresolved candidates getting dropped.
+        const filler: ExternalCandidate[] = [];
+        for (let i = 0; i < 13; i++) {
+          const body = `# Filler ${i}\n\nFiller content number ${i}.`;
+          const hash = await hashContent(body);
+          await insertTestDocument(store.db, "docs", { name: `filler-${i}`, hash, body });
+          filler.push({ hash, seq: 0, collection: "docs", score: 0.7 });
+        }
+        const candidates: ExternalCandidate[] = [
+          { hash: hashFirst, seq: 0, collection: "docs", score: 0.5 },
+          ...filler,
+          { hash: hashLast, seq: 0, collection: "docs", score: 0.5 },
+        ];
+
+        // limit exceeds candidates.length so nothing is truncated before
+        // the position-weight comparison below.
+        const { results } = await rerankExternalCandidates(store, "query", candidates, { limit: 20, minScore: 0 });
+        const first = results.find(r => r.displayPath === "docs/test/first.md");
+        const last = results.find(r => r.displayPath === "docs/test/last.md");
+
+        expect(first).toBeDefined();
+        expect(last).toBeDefined();
+        // Same rerank score, but "first" gets the top-3 position weight
+        // (0.75) and "last" gets the beyond-top-10 weight (0.40) — with an
+        // identical reranker score, the position-blend must break the tie.
+        expect(first!.score).not.toBe(last!.score);
+      } finally {
+        await cleanupTestDb(store);
+      }
+    });
   });
 
   test("structuredSearch uses the active llm embed model for precomputed vector lookups", async () => {

@@ -5018,6 +5018,47 @@ export async function hybridQuery(
 
   if (candidates.length === 0) return [];
 
+  // Steps 5-8 (chunk-selection, rerank, position-blend, dedup) are shared
+  // with rerankExternalCandidates() — see rerankAndBlend() below.
+  return rerankAndBlend(store, query, candidates, docidMap, rrfTraceByFile, {
+    limit, minScore, candidateLimit, explain, intent, skipRerank, chunkStrategy: options?.chunkStrategy, hooks,
+  });
+}
+
+/**
+ * Steps 5-8 of hybridQuery(): chunk-selection, LLM rerank, position-aware
+ * score blending, and final dedup/filter/slice. Factored out so
+ * rerankExternalCandidates() (candidates supplied from outside qmd, e.g. a
+ * pgvector KNN result) can reuse the exact same logic that FTS/vec-sourced
+ * candidates go through — `candidates` must already be in the caller's
+ * final rank order, since array position stands in for RRF rank in the
+ * step-7 blend weight.
+ */
+async function rerankAndBlend(
+  store: Store,
+  query: string,
+  candidates: RankedResult[],
+  docidMap: Map<string, string>,
+  rrfTraceByFile: Map<string, RRFScoreTrace> | null,
+  options: {
+    limit?: number;
+    minScore?: number;
+    candidateLimit?: number;
+    explain?: boolean;
+    intent?: string;
+    skipRerank?: boolean;
+    chunkStrategy?: ChunkStrategy;
+    hooks?: SearchHooks;
+  }
+): Promise<HybridQueryResult[]> {
+  const limit = options.limit ?? 10;
+  const minScore = options.minScore ?? 0;
+  const candidateLimit = options.candidateLimit ?? candidates.length;
+  const explain = options.explain ?? false;
+  const intent = options.intent;
+  const skipRerank = options.skipRerank ?? false;
+  const hooks = options.hooks;
+
   // Step 5: Chunk documents, pick best chunk per doc for reranking.
   // Reranking full bodies is O(tokens) — the critical perf lesson that motivated this refactor.
   const queryTerms = query.toLowerCase().split(/\s+/).filter(t => t.length > 2);
@@ -5171,6 +5212,148 @@ export async function hybridQuery(
     })
     .filter(r => r.score >= minScore)
     .slice(0, limit);
+}
+
+// =============================================================================
+// External candidate reranking (ADR 0015, jawk-ai/qmd-hub#62 phase 3)
+//
+// qmd stays the sole holder of document bodies — an external caller (e.g. the
+// qmd-hub worker, which runs its own KNN against pgvector) cannot supply
+// chunk text itself without duplicating the corpus. What it CAN supply is the
+// same (collection, hash, seq) identity pgvector's own index rows carry —
+// exactly qmd's own chunk addressing scheme (see `content_vectors`). This
+// resolves those back to document bodies via qmd's SQLite `documents`/
+// `content` tables, then runs the identical chunk-selection/rerank/blend
+// steps (5-7) hybridQuery() uses for FTS/vec-sourced candidates.
+// =============================================================================
+
+export interface ExternalCandidate {
+  hash: string;
+  seq: number;
+  /** Required — vector_chunks is partitioned by collection, and the same
+   *  content hash can legitimately appear in more than one collection, so
+   *  collection is part of the candidate's identity, not just a filter. */
+  collection: string;
+  /** Caller-computed relevance score (e.g. an RRF merge of BM25 + pgvector
+   *  KNN). Only used for `explain` output — rank ORDER (this array's index
+   *  order) is what step 7's position-blend actually keys off of. */
+  score: number;
+}
+
+/**
+ * Resolve external (hash, collection) candidates to document bodies via
+ * qmd's own SQLite index, deduped one-per-document (matching the
+ * per-filepath granularity hybridQuery()'s own FTS/vec candidates already
+ * have), preserving the caller's first-seen rank order.
+ *
+ * Known limitation: `seq` (which specific chunk pgvector's KNN matched) is
+ * accepted but not used — chunk-selection in step 5 re-derives its own best
+ * chunk via query/intent keyword overlap against the full body, exactly like
+ * it already does for FTS/vec candidates today. That's existing behavior,
+ * not a regression introduced here, but it means the actual embedding-
+ * matched chunk is discarded. Worth revisiting once this primitive is
+ * proven — not required to prove the primitive itself.
+ */
+function resolveCandidatesByHash(
+  db: Database,
+  candidates: ExternalCandidate[]
+): { resolved: RankedResult[]; docidMap: Map<string, string>; unresolvedCount: number } {
+  const byKey = new Map<string, { hash: string; collection: string; score: number; firstIndex: number }>();
+  candidates.forEach((c, i) => {
+    const key = `${c.collection} ${c.hash}`;
+    const existing = byKey.get(key);
+    if (!existing || c.score > existing.score) {
+      byKey.set(key, { hash: c.hash, collection: c.collection, score: c.score, firstIndex: existing?.firstIndex ?? i });
+    }
+  });
+  const ordered = [...byKey.values()].sort((a, b) => a.firstIndex - b.firstIndex);
+
+  const docidMap = new Map<string, string>();
+  const resolved: RankedResult[] = [];
+  let unresolvedCount = 0;
+
+  const stmt = db.prepare(`
+    SELECT
+      'qmd://' || d.collection || '/' || d.path as filepath,
+      d.collection || '/' || d.path as display_path,
+      d.title,
+      content.doc as body
+    FROM documents d
+    JOIN content ON content.hash = d.hash
+    WHERE d.hash = ? AND d.collection = ? AND d.active = 1
+  `);
+
+  for (const { hash, collection, score } of ordered) {
+    const row = stmt.get(hash, collection) as
+      { filepath: string; display_path: string; title: string; body: string } | undefined;
+
+    if (!row) { unresolvedCount++; continue; }
+
+    docidMap.set(row.filepath, getDocid(hash));
+    resolved.push({
+      file: row.filepath,
+      displayPath: row.display_path,
+      title: row.title,
+      body: row.body,
+      score,
+    });
+  }
+
+  return { resolved, docidMap, unresolvedCount };
+}
+
+export interface RerankExternalCandidatesOptions {
+  limit?: number;
+  minScore?: number;
+  explain?: boolean;
+  intent?: string;
+  chunkStrategy?: ChunkStrategy;
+  hooks?: SearchHooks;
+}
+
+export interface RerankExternalCandidatesResult {
+  results: HybridQueryResult[];
+  /** Candidates whose (hash, collection) had no active document in this qmd
+   *  index — e.g. the caller's vector index has drifted from qmd's current
+   *  state. Silently dropped from `results`, counted here for observability. */
+  unresolvedCount: number;
+}
+
+/**
+ * Rerank an externally-supplied, pre-ranked candidate list without running
+ * qmd's own FTS/vec retrieval (hybridQuery() steps 1-4). See the module
+ * comment above for why candidates are addressed by (hash, seq, collection)
+ * rather than by file+text.
+ *
+ * `candidates` must already be in the caller's final rank order (its own
+ * RRF merge of, e.g., BM25 + pgvector KNN) — that order stands in for
+ * hybridQuery()'s own RRF rank in the step-7 position-blend weight, so a
+ * caller-side re-sort after the fact would silently invalidate the blend.
+ */
+export async function rerankExternalCandidates(
+  store: Store,
+  query: string,
+  candidates: ExternalCandidate[],
+  options?: RerankExternalCandidatesOptions
+): Promise<RerankExternalCandidatesResult> {
+  if (candidates.length === 0) return { results: [], unresolvedCount: 0 };
+
+  const { resolved, docidMap, unresolvedCount } = resolveCandidatesByHash(store.db, candidates);
+
+  if (resolved.length === 0) return { results: [], unresolvedCount };
+
+  const results = await rerankAndBlend(store, query, resolved, docidMap, null, {
+    limit: options?.limit,
+    minScore: options?.minScore,
+    candidateLimit: resolved.length,
+    explain: options?.explain,
+    intent: options?.intent,
+    skipRerank: false,
+    chunkStrategy: options?.chunkStrategy,
+    hooks: options?.hooks,
+  });
+
+  return { results, unresolvedCount };
 }
 
 export interface VectorSearchOptions {

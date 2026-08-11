@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Added
+
+- **External candidate reranking** (`store.rerankCandidates()`, MCP tool
+  `rerank_candidates`). Lets a caller that already ran its own retrieval
+  outside qmd (e.g. a vector search against an external index) get qmd's
+  chunk-selection, LLM rerank, and position-aware score blend without qmd
+  re-running FTS/vector search. Candidates are addressed by `(hash, seq,
+  collection)` — qmd's own chunk identity — since qmd is the sole holder of
+  document bodies. Part of jawk-ai/qmd-hub#62 (ADR 0015) phase 3; resolves
+  that ADR's open "exact shape of this primitive" question in favor of
+  hash-addressed candidates rather than caller-supplied text.
+
 ### Fixed
 
 - **Zombie rerank job pileup (#105).** A client that times out and retries no
