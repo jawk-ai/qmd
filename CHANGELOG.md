@@ -12,7 +12,11 @@
   collection)` — qmd's own chunk identity — since qmd is the sole holder of
   document bodies. Part of jawk-ai/qmd-hub#62 (ADR 0015) phase 3; resolves
   that ADR's open "exact shape of this primitive" question in favor of
-  hash-addressed candidates rather than caller-supplied text.
+  hash-addressed candidates rather than caller-supplied text. Takes a
+  `rerank` option (default true, same semantics as the `query` tool's) so a
+  caller can skip the LLM rerank and get candidates ordered by their own
+  score — needed for latency-comparable A/B runs against an sqlite baseline
+  also run with rerank off (Bugbot finding on jawk-ai/qmd-hub#182).
 
 ### Fixed
 

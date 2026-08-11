@@ -3565,6 +3565,37 @@ describe("Embedding batching", () => {
       }
     });
 
+    test("rerank: false skips the LLM call and orders by caller-supplied candidate order", async () => {
+      const store = await createTestStore();
+      await createTestCollection({ name: "docs" });
+      const rerankSpy = vi.fn(async (_q: string, docs: { file: string; text: string }[]) =>
+        docs.map((d, i) => ({ file: d.file, score: 1 - i * 0.1 })));
+      store.rerank = rerankSpy as any;
+
+      try {
+        const hashA = await hashContent("# Alpha\n\nAlpha content about caching.");
+        const hashB = await hashContent("# Beta\n\nBeta content about queues.");
+        await insertTestDocument(store.db, "docs", { name: "alpha", hash: hashA, body: "# Alpha\n\nAlpha content about caching." });
+        await insertTestDocument(store.db, "docs", { name: "beta", hash: hashB, body: "# Beta\n\nBeta content about queues." });
+
+        // hashB first in caller order, despite a lower caller-supplied score
+        // — with rerank off, output order must follow candidate array
+        // position (the RRF-only path), not re-sort by score.
+        const candidates: ExternalCandidate[] = [
+          { hash: hashB, seq: 0, collection: "docs", score: 0.5 },
+          { hash: hashA, seq: 0, collection: "docs", score: 0.9 },
+        ];
+
+        const { results, unresolvedCount } = await rerankExternalCandidates(store, "caching", candidates, { limit: 10, minScore: 0, rerank: false });
+
+        expect(unresolvedCount).toBe(0);
+        expect(rerankSpy).not.toHaveBeenCalled();
+        expect(results.map(r => r.displayPath)).toEqual(["docs/test/beta.md", "docs/test/alpha.md"]);
+      } finally {
+        await cleanupTestDb(store);
+      }
+    });
+
     test("drops candidates whose hash has no active document and counts them", async () => {
       const store = await createTestStore();
       await createTestCollection({ name: "docs" });

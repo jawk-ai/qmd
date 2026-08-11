@@ -5309,6 +5309,12 @@ export interface RerankExternalCandidatesOptions {
   intent?: string;
   chunkStrategy?: ChunkStrategy;
   hooks?: SearchHooks;
+  /** Rerank candidates using the LLM (default: true). Set false to return
+   *  candidates ordered by the caller's own score only — same semantics as
+   *  the `query` tool's `rerank` option, needed so a caller comparing
+   *  against an sqlite baseline with rerank off can run this path with rerank
+   *  off too and get a latency/ranking-comparable result. */
+  rerank?: boolean;
 }
 
 export interface RerankExternalCandidatesResult {
@@ -5348,7 +5354,7 @@ export async function rerankExternalCandidates(
     candidateLimit: resolved.length,
     explain: options?.explain,
     intent: options?.intent,
-    skipRerank: false,
+    skipRerank: options?.rerank === false,
     chunkStrategy: options?.chunkStrategy,
     hooks: options?.hooks,
   });

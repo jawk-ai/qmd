@@ -440,13 +440,17 @@ Candidates whose (hash, collection) has no active document in this qmd index are
         limit: z.number().optional().default(10).describe("Max results (default: 10)"),
         minScore: z.number().optional().default(0).describe("Min relevance 0-1 (default: 0)"),
         intent: z.string().optional().describe("Background context to disambiguate the query, same semantics as the query tool's intent"),
+        rerank: z.boolean().optional().default(true).describe(
+          "Rerank candidates using the LLM (default: true). Set false to return candidates ordered by the caller's own score only — same semantics as the query tool's rerank option."
+        ),
       },
     },
-    async ({ query, candidates, limit, minScore, intent }) => {
+    async ({ query, candidates, limit, minScore, intent, rerank }) => {
       const { results, unresolvedCount } = await store.rerankCandidates(query, candidates, {
         limit,
         minScore,
         intent,
+        rerank,
       });
 
       const filtered: SearchResultItem[] = results.map(r => {
